@@ -74,34 +74,131 @@ MODE="install"
 SB_SETUP_METHOD="ask"
 THEME_METHOD="ask"
 
-# ---------------------------------------------------------------- colors ----
+# ------------------------------------------------------- colors + visuals ----
 
 if [[ -t 1 ]]; then
-  C_RED=$'\e[31m'; C_GRN=$'\e[32m'; C_YLW=$'\e[33m'; C_BLU=$'\e[34m'
+  C_RED=$'\e[31m'; C_GRN=$'\e[32m'; C_YLW=$'\e[33m'
   C_MAG=$'\e[35m'; C_CYN=$'\e[36m'; C_BLD=$'\e[1m'; C_RST=$'\e[0m'
+  C_DIM=$'\e[2m'; C_GRY=$'\e[90m'
 else
-  C_RED=""; C_GRN=""; C_YLW=""; C_BLU=""; C_MAG=""; C_CYN=""; C_BLD=""; C_RST=""
+  C_RED=""; C_GRN=""; C_YLW=""; C_MAG=""; C_CYN=""; C_BLD=""
+  C_RST=""; C_DIM=""; C_GRY=""
 fi
 
-log()  { echo "${C_CYN}[*]${C_RST} $*" | tee -a "$LOG_FILE" >&2 2>/dev/null || echo "[*] $*" >&2; }
-ok()   { echo "${C_GRN}[OK]${C_RST} $*" | tee -a "$LOG_FILE" >&2 2>/dev/null || echo "[OK] $*" >&2; }
-warn() { echo "${C_YLW}[!!]${C_RST} $*" | tee -a "$LOG_FILE" >&2 2>/dev/null || echo "[!!] $*" >&2; }
-err()  { echo "${C_RED}[XX]${C_RST} $*" | tee -a "$LOG_FILE" >&2 2>/dev/null || echo "[XX] $*" >&2; }
+# Terminal width for section rules (capped — long rules look silly on wide screens).
+term_cols() {
+  local c="${COLUMNS:-}"
+  [[ "$c" =~ ^[0-9]+$ ]] || c="$(tput cols 2>/dev/null || echo 80)"
+  (( c > 100 )) && c=100
+  (( c < 40 )) && c=40
+  printf '%s' "$c"
+}
+
+# Status lines: coloured on the terminal, plain text in the log file.
+# (Redirects on the brace group, so an unwritable log never kills the script.)
+_ui() {
+  { printf '%s\n' "$2" >> "$LOG_FILE"; } 2>/dev/null || true
+  printf '%s\n' "$1" >&2
+}
+log()  { _ui "${C_CYN}  ·${C_RST} $*" "  · $*"; }
+ok()   { _ui "${C_GRN} [✔]${C_RST} $*" " [✔] $*"; }
+warn() { _ui "${C_YLW} [⚠]${C_RST} $*" " [⚠] $*"; }
+err()  { _ui "${C_RED} [✖]${C_RST} $*" " [✖] $*"; }
 die()  { err "$*"; exit 1; }
 
+# `── Section title ─────…` header.
+section() {
+  local LC_ALL=C.UTF-8   # count characters, not bytes (em dashes etc.)
+  local title="$*" pad rule
+  pad=$(( $(term_cols) - ${#title} - 4 ))   # 4 = "── " prefix + trailing space
+  (( pad < 3 )) && pad=3
+  printf -v rule '%*s' "$pad" ''
+  printf '\n%s── %s %s%s%s\n' "$C_BLD$C_CYN" "$title" "${rule// /─}" "$C_RST"
+}
+
+# Smaller header inside a section.
+subhead() { printf '\n  %s%s%s\n' "$C_BLD" "$*" "$C_RST"; }
+
+# Aligned "label : value" info line; status-ish values get colour.
+kv() {
+  local label="$1" value="$2" paint=""
+  case "$value" in
+    *MISSING*|*PENDING*|*'NOT '*|*'not '*|*'unknown'*|*'failed'*) paint="$C_YLW" ;;
+    *ENROLLED*|*VALID*|*'present'*|*'active'*|*'yes'*)            paint="$C_GRN" ;;
+  esac
+  printf '  %s%-13s:%s %s%s%s\n' "$C_DIM" "$label" "$C_RST" "$paint" "$value" "$C_RST"
+}
+
+# Dim, indented note; wraps to the terminal width.
+hint() {
+  local cols
+  cols="$(term_cols)"
+  printf '%s\n' "$*" | fold -s -w "$((cols - 4))" \
+    | while IFS= read -r l; do printf '    %s%s%s\n' "$C_DIM" "$l" "$C_RST"; done
+}
+bullet() { printf '  %s•%s %s\n' "$C_CYN" "$C_RST" "$*"; }
+
+# "▸ Step 3/10  Download Limine" progress marker for the install wizard.
+# Pass "-" as the step number to print a plain marker without the counter.
+phase() {
+  if [[ "$1" =~ ^[0-9]+$ ]]; then
+    printf '\n  %s▸ Step %s/%s%s  %s%s%s\n' "$C_CYN$C_BLD" "$1" "$2" "$C_RST" "$C_BLD" "$3" "$C_RST"
+  else
+    printf '\n  %s▸%s  %s%s%s\n' "$C_CYN$C_BLD" "$C_RST" "$C_BLD" "$3" "$C_RST"
+  fi
+}
+
+# Indent raw command output (efibootmgr, ls, rpm, …) so it sits inside a section.
+ui_indent() { sed 's/^/  /'; }
+
+# efibootmgr -v without the unreadable device-path hex dumps.
+efi_list() { efibootmgr -v 2>/dev/null | grep -Ev '^[[:space:]]+(dp|data):'; }
+
+dry_print() { printf '  %s(dry-run)%s %s\n' "$C_YLW" "$C_RST" "$*"; }
+
 banner() {
-  cat <<'EOF'
-  ╔══════════════════════════════════════════════════════╗
-  ║   Fedora → Limine switcher  (CachyOS-style suite)    ║
-  ║   Idiot-proof. Keeps GRUB as fallback. Undoable.     ║
-  ╚══════════════════════════════════════════════════════╝
-EOF
+  local LC_ALL=C.UTF-8   # count characters, not bytes (→ and — are 3 bytes)
+  local l1="Fedora → Limine switcher"
+  local l2="Swap GRUB for Limine — GRUB stays as fallback."
+  local w=$(( ${#l1} > ${#l2} ? ${#l1} : ${#l2} )) bar pad1 pad2
+  # NOTE: printf '%-*s' pads by BYTES, so pad spaces are built separately.
+  printf -v bar '%*s' "$((w + 2))" ''
+  printf -v pad1 '%*s' "$(( w - ${#l1} ))" ''
+  printf -v pad2 '%*s' "$(( w - ${#l2} ))" ''
+  bar="${bar// /─}"
+  printf '\n%s╭%s╮%s\n' "$C_CYN$C_BLD" "$bar" "$C_RST"
+  printf '%s│%s %s%s%s%s %s│%s\n' "$C_CYN$C_BLD" "$C_RST" "$C_BLD" "$l1" "$pad1" "$C_RST" "$C_CYN$C_BLD" "$C_RST"
+  printf '%s│%s %s%s%s%s %s│%s\n' "$C_CYN$C_BLD" "$C_RST" "$C_DIM" "$l2" "$pad2" "$C_RST" "$C_CYN$C_BLD" "$C_RST"
+  printf '%s╰%s╯%s\n' "$C_CYN$C_BLD" "$bar" "$C_RST"
 }
 
 # ---------------------------------------------------------------- args -----
 
 usage() {
-  grep '^#' "$0" | sed -n '/Usage:/,/dry-run/p' | sed 's/^# \?//'
+  banner
+  cat <<EOF
+
+${C_BLD}Usage:${C_RST} sudo $0 [options]
+
+${C_BLD}Install${C_RST}
+  (no options)   interactive wizard — start here
+  --check        preflight only, change nothing
+  --dry-run, -n  print what would happen instead of doing it
+  --yes, -y      non-interactive defaults (never enrolls Secure Boot keys)
+  --update       re-sync kernels + regenerate limine.conf
+  --uninstall    roll back to GRUB-first
+
+${C_BLD}Secure Boot${C_RST}
+  --sb-setup[=mok-shim|custom-db]   sign Limine + enroll your key
+  --sb-status                       report Secure Boot state, change nothing
+  --sb-resign                       re-enroll conf hash + re-sign EFI files
+
+${C_BLD}Other${C_RST}
+  --theme[=name]  install or switch the boot theme
+  --help, -h      this text
+
+Docs: README.md and the docs/ folder.
+EOF
 }
 
 while [[ $# -gt 0 ]]; do
@@ -125,11 +222,11 @@ done
 # ---------------------------------------------------------------- helpers --
 
 confirm() {
-  local prompt="${1:-Proceed?} [y/N]: "
+  local prompt="${1:-Proceed?}"
   if [[ "$ASSUME_YES" -eq 1 ]]; then return 0; fi
-  if [[ "$DRY_RUN" -eq 1 ]]; then echo "(dry-run: would ask: $prompt)"; return 0; fi
+  if [[ "$DRY_RUN" -eq 1 ]]; then echo "(dry-run: would ask: $prompt [y/N])"; return 0; fi
   local ans=""
-  read -r -p "$prompt" ans || true
+  read -r -p "$(printf '%s?%s %s [y/N] ' "$C_BLD$C_MAG" "$C_RST" "$prompt")" ans || true
   ans="${ans,,}"   # lowercase
   [[ "$ans" == "y" || "$ans" == "yes" ]]
 }
@@ -138,7 +235,7 @@ confirm() {
 ask_with_default() {
   local prompt="$1" def="$2" ans=""
   if [[ "$ASSUME_YES" -eq 1 ]]; then echo "$def"; return; fi
-  read -r -p "$prompt [$def]: " ans || true
+  read -r -p "$(printf '%s?%s %s [%s] ' "$C_BLD$C_MAG" "$C_RST" "$prompt" "$def")" ans || true
   echo "${ans:-$def}"
 }
 
@@ -148,9 +245,7 @@ ask_yes_no() {
   local prompt="$1" def="${2:-no}" ans=""
   if [[ "$ASSUME_YES" -eq 1 ]]; then echo "yes"; return; fi
   if [[ "$DRY_RUN" -eq 1 ]]; then echo "(dry-run: $prompt -> $def)"; echo "$def"; return; fi
-  local d1="y" d2="n"
-  [[ "$def" == "yes" ]] && d1="[y]" || d2="[n]"
-  read -r -p "$prompt (y/n) [$def]: " ans || true
+  read -r -p "$(printf '%s?%s %s (y/n) [%s] ' "$C_BLD$C_MAG" "$C_RST" "$prompt" "$def")" ans || true
   ans="${ans,,}"
   if [[ -z "$ans" ]]; then
     echo "$def"
@@ -173,14 +268,13 @@ ask_numbered() {
   if [[ "$ASSUME_YES" -eq 1 ]]; then echo "1"; return; fi
   if [[ "$DRY_RUN" -eq 1 ]]; then
     echo "(dry-run: $prompt -> ${opts[0]})"; echo "1"; return; fi
-  echo >&2
-  echo "$prompt" >&2
+  section "$prompt" >&2
   i=1
   for o in "${opts[@]}"; do
-    echo "  $i) $o" >&2
+    printf '  %s%2d)%s %s\n' "$C_CYN$C_BLD" "$i" "$C_RST" "$o" >&2
     ((i++)) || true
   done
-  read -r -p "Choose [1-${#opts[@]}]: " ans || true
+  read -r -p "$(printf '%s?%s Choose [1-%d] (Enter = %d) ' "$C_BLD$C_MAG" "$C_RST" "${#opts[@]}" 1)" ans || true
   # Validate: must be a number in range.
   if [[ "$ans" =~ ^[0-9]+$ ]] && [[ "$ans" -ge 1 ]] && [[ "$ans" -le ${#opts[@]} ]]; then
     echo "$ans"
@@ -204,19 +298,18 @@ limine_version_menu() {
     echo "$LIMINE_FALLBACK_VERSION"
     return
   fi
-  echo >&2
-  echo "${C_BLD}--- Limine version ---${C_RST}" >&2
-  echo "Available releases (newest first):" >&2
+  section "Limine version" >&2
+  printf '  %sAvailable releases (newest first):%s\n' "$C_DIM" "$C_RST" >&2
   i=1
   for ver in "${releases[@]}"; do
-    echo "  $i) v$ver" >&2
+    printf '  %s%2d)%s v%s\n' "$C_CYN$C_BLD" "$i" "$C_RST" "$ver" >&2
     ((i++)) || true
   done
-  echo "  0) Enter a custom version" >&2
-  read -r -p "Choose [1-${#releases[@]} or 0 for custom]: " ans || true
+  printf '  %s  0)%s Enter a custom version\n' "$C_CYN" "$C_RST" >&2
+  read -r -p "$(printf '%s?%s Choose [1-%d or 0 for custom] ' "$C_BLD$C_MAG" "$C_RST" "${#releases[@]}")" ans || true
   ans="${ans,,}"
   if [[ "$ans" == "0" ]]; then
-    read -r -p "Enter Limine version (e.g. 12.9.3): " ver || true
+    read -r -p "$(printf '%s?%s Limine version (e.g. 12.9.3) ' "$C_BLD$C_MAG" "$C_RST")" ver || true
     ver="${ver#v}"
     [[ -n "$ver" ]] && echo "$ver" || echo "$LIMINE_FALLBACK_VERSION"
     return
@@ -231,7 +324,7 @@ limine_version_menu() {
 
 run() {
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    echo "  (dry-run) $*"
+    dry_print "$*"
   else
     "$@"
   fi
@@ -255,6 +348,14 @@ secureboot_state() {
     bootctl status 2>/dev/null | grep -i "Secure Boot" || echo "unknown"
   else
     echo "unknown (install mokutil to check)"
+  fi
+}
+
+# Sets SB_STATE (enabled/disabled/unknown) without printing anything.
+detect_sb_state() {
+  SB_STATE="unknown"
+  if secureboot_state | grep -qi enabled; then SB_STATE="enabled"
+  elif secureboot_state | grep -qi disabled; then SB_STATE="disabled"
   fi
 }
 
@@ -291,15 +392,15 @@ esp_source() { findmnt -n -o SOURCE --target "$1" 2>/dev/null | head -n1; }
 esp_details() {
   local esp="$1" src disk part
   src="$(esp_source "$esp")"
-  echo "ESP mount : $esp"
-  echo "ESP source: ${src:-unknown}"
-  df -h "$esp" 2>/dev/null | tail -n1 || true
+  kv "mount" "$esp"
+  kv "source" "${src:-unknown}"
+  df -h "$esp" 2>/dev/null | tail -n1 | ui_indent || true
   if [[ -n "${src:-}" ]]; then
     disk="$(lsblk -n -o PKNAME "$src" 2>/dev/null | head -n1 || true)"
     part="$(lsblk -n -o PARTN "$src" 2>/dev/null | head -n1 || true)"
-    [[ -n "$disk" ]] && echo "ESP disk  : /dev/$disk  part #: ${part:-?}"
-    echo "ESP PARTUUID: $(lsblk -n -o PARTUUID "$src" 2>/dev/null | head -n1 || echo ?)"
-    echo "ESP FAT UUID: $(lsblk -n -o UUID "$src" 2>/dev/null | head -n1 || echo ?)"
+    [[ -n "$disk" ]] && kv "disk" "/dev/$disk  part #${part:-?}"
+    kv "partuuid" "$(lsblk -n -o PARTUUID "$src" 2>/dev/null | head -n1 || echo ?)"
+    kv "fat uuid" "$(lsblk -n -o UUID "$src" 2>/dev/null | head -n1 || echo ?)"
   fi
 }
 
@@ -373,10 +474,14 @@ latest_limine_version() {
 
 preflight() {
   banner
-  echo "Mode: $MODE   (dry-run=$DRY_RUN assume-yes=$ASSUME_YES)"
-  echo
+  printf '  %sMode:%s %s' "$C_DIM" "$C_RST" "$MODE"
+  [[ "$DRY_RUN" -eq 1 ]] && printf '  %s(dry-run)%s' "$C_YLW" "$C_RST"
+  [[ "$ASSUME_YES" -eq 1 ]] && printf '  %s(auto-yes)%s' "$C_YLW" "$C_RST"
+  printf '\n'
 
   is_fedora || die "This script is for Fedora only (ID=fedora in /etc/os-release)."
+
+  section "System"
   ok "Fedora detected: $(fedora_version)"
 
   local fw
@@ -387,25 +492,23 @@ preflight() {
     warn "Firmware: legacy BIOS detected. UEFI is recommended; BIOS install is best-effort."
   fi
 
-  echo "--- Secure Boot ---"
-  SB_STATE="unknown"
-  if secureboot_state | grep -qi enabled; then SB_STATE="enabled"; elif secureboot_state | grep -qi disabled; then SB_STATE="disabled"; fi
-  secureboot_state || true
+  section "Secure Boot"
+  detect_sb_state
+  kv "firmware" "$(secureboot_state 2>/dev/null | head -n1 || echo unknown)"
   if [[ "$SB_STATE" == "enabled" ]]; then
     warn "Secure Boot is ENABLED. Upstream Limine is NOT Microsoft-signed."
-    echo "  The installer keeps GRUB working and offers opt-in signing later:"
-    echo "    - mok-shim (recommended): MOK key + shim chainload, no firmware Setup Mode."
-    echo "    - custom-db (advanced): own DB keys + firmware Setup Mode enrollment."
-    echo "  See README 'Secure Boot'. You can also pick this post-install:"
-    echo "    sudo $0 --sb-setup"
+    hint "GRUB keeps working; signing Limine is offered later, opt-in:"
+    hint "• mok-shim (recommended) — MOK key + shim chainload, no firmware Setup Mode"
+    hint "• custom-db (advanced)   — own DB keys + firmware Setup Mode enrollment"
+    hint "Docs: docs/secure-boot.md — or afterwards:  sudo $0 --sb-setup"
   elif [[ "$SB_STATE" == "disabled" ]]; then
-    ok "Secure Boot: disabled — Limine boots unsigned. Signing stays optional:"
-    echo "  sudo $0 --sb-setup   (only needed if you plan to re-enable Secure Boot)"
+    ok "Secure Boot: disabled — Limine boots unsigned, signing stays optional"
+    hint "Only needed if you plan to re-enable Secure Boot:  sudo $0 --sb-setup"
   else
     warn "Secure Boot state unknown (mokutil missing?). Continuing; signing stays optional."
   fi
 
-  echo "--- ESP ---"
+  section "EFI system partition"
   local esp
   esp="$(detect_esp)" || die "Could not find ESP. Expected /boot/efi (vfat). Mount it first."
   esp_details "$esp"
@@ -415,14 +518,17 @@ preflight() {
   [[ "$fstype" == "vfat" ]] || warn "ESP fstype is '$fstype' (expected vfat). Continuing, but Limine needs FAT."
   ok "ESP found at $esp"
 
-  echo "--- Space ---"
+  section "Space"
   local free need
   free="$(esp_free_mb "$esp")"
   need="$(needed_mb_estimate)"
-  echo "ESP free: ${free}MB   estimated need (all kernels + 60MB headroom): ${need}MB"
+  kv "ESP free" "${free} MB"
+  kv "need (est)" "${need} MB   (all kernels + 60 MB headroom)"
   if [[ "$free" -lt "$need" ]]; then
-    warn "ESP may be too small. Fix: sudo dnf remove --oldinstallonly (keep 2 kernels),"
-    warn "or set installonly_limit=2 in /etc/dnf/dnf.conf, or enlarge the ESP."
+    warn "ESP may be too small. Options:"
+    hint "sudo dnf remove --oldinstallonly         (keep only 2 kernels)"
+    hint "set installonly_limit=2 in /etc/dnf/dnf.conf"
+    hint "or enlarge the ESP"
     if ! confirm "Continue despite tight ESP space?"; then
       die "Aborted. Free ESP space and re-run."
     fi
@@ -430,36 +536,35 @@ preflight() {
     ok "ESP space looks fine."
   fi
 
-  echo "--- Kernels ---"
+  section "Kernels"
   local k
   k="$(list_fedora_kernels)"
   [[ -n "$k" ]] || die "No /boot/vmlinuz-* kernels found. Is this a Fedora install?"
-  echo "$k" | while read -r v; do echo "  - $v"; done
-  echo "cmdline: $(kernel_cmdline)"
-  echo "root hint: $(root_hint)"
+  printf '%s\n' "$k" | while read -r v; do printf '  %s•%s %s\n' "$C_GRY" "$C_RST" "$v"; done
+  kv "cmdline" "$(kernel_cmdline)"
+  kv "root hint" "$(root_hint)"
 
-  echo "--- Bootloader state ---"
-  efibootmgr -v 2>/dev/null | head -n 30 || warn "efibootmgr output unavailable."
-  rpm -q grub2-efi-x64 grub2-common shim-x64 grubby 2>/dev/null || true
+  section "Boot entries"
+  efi_list | head -n 30 | ui_indent || warn "efibootmgr output unavailable."
+  rpm -q grub2-efi-x64 grub2-common shim-x64 grubby 2>/dev/null | ui_indent || true
   if [[ -d /boot/grub2 || -d /boot/efi/EFI/fedora ]]; then
     ok "GRUB/Shim install detected (will be KEPT as fallback)."
   fi
 
-  echo "--- Extras auto-detect ---"
+  section "Extras auto-detect"
   local rootfs
   rootfs="$(findmnt -n -o FSTYPE / 2>/dev/null || echo ?)"
-  echo "Root fs: $rootfs"
+  kv "root fs" "$rootfs"
   if [[ "$rootfs" == "btrfs" ]]; then
-    echo "  -> BTRFS detected: snapshot boot entries are available (optional)."
+    hint "BTRFS detected: snapshot boot entries are available (optional)."
   else
-    echo "  -> Not BTRFS (this machine: $rootfs): snapshot entries will be skipped."
+    hint "Not BTRFS ($rootfs): snapshot entries will be skipped."
   fi
-  command -v os-prober >/dev/null 2>&1 && echo "  -> os-prober present" || echo "  -> os-prober not installed (Windows scan optional)"
-  [[ -d /boot/efi/EFI/Microsoft ]] && echo "  -> Windows ESP dir detected" || echo "  -> No Windows ESP dir seen"
+  if command -v os-prober >/dev/null 2>&1; then hint "os-prober present"; else hint "os-prober not installed (Windows scan optional)"; fi
+  if [[ -d /boot/efi/EFI/Microsoft ]]; then hint "Windows ESP dir detected"; else hint "No Windows ESP dir seen"; fi
 
   nvidia_preflight_report || true
 
-  echo
   # Export for later steps
   ESP="$esp"
 }
@@ -478,7 +583,7 @@ install_deps() {
   #   edk2-shell-x64 -> /usr/share/edk2/ovmf/Shell.efi
   local opt_pkgs=(os-prober sbsigntools openssl memtest86+ edk2-shell-x64 snapper python3)
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    echo "  (dry-run) dnf install -y ${pkgs[*]} ${opt_pkgs[*]}"
+    dry_print "dnf install -y ${pkgs[*]} ${opt_pkgs[*]}"
     return 0
   fi
   run dnf install -y "${pkgs[@]}" || die "dnf install of required deps failed."
@@ -492,8 +597,8 @@ fetch_limine() {
   local ver="$1" work="$2"
   local url="${LIMINE_BINARY_URL_TMPL//__VER__/$ver}"
   log "Downloading Limine v$ver binary release..."
-  echo "  URL: $url"
-  if [[ "$DRY_RUN" -eq 1 ]]; then echo "  (dry-run) curl -> $work/limine-binary.tar.xz"; return 0; fi
+  printf '  %sURL: %s%s\n' "$C_DIM" "$url" "$C_RST"
+  if [[ "$DRY_RUN" -eq 1 ]]; then dry_print "curl -> $work/limine-binary.tar.xz"; return 0; fi
   mkdir -p "$work"
   curl -fSL --retry 3 -o "$work/limine-binary.tar.xz" "$url" || die "Download failed: $url"
   tar -tf "$work/limine-binary.tar.xz" | head -n 20
@@ -518,8 +623,7 @@ deploy_uefi() {
   local esp="$1" src="$2"
   local dest_dir="$esp/EFI/limine" fallback="$esp/EFI/BOOT/BOOTX64.EFI"
   log "Deploying Limine UEFI binaries..."
-  echo "  $src/BOOTX64.EFI -> $dest_dir/limine_x64.efi"
-  if [[ "$DRY_RUN" -eq 1 ]]; then echo "  (dry-run) mkdir + cp + fallback"; return 0; fi
+  if [[ "$DRY_RUN" -eq 1 ]]; then dry_print "mkdir + cp $src/BOOTX64.EFI -> $dest_dir/limine_x64.efi (+ fallback)"; return 0; fi
   mkdir -p "$dest_dir"
   cp -v "$src/BOOTX64.EFI" "$dest_dir/limine_x64.efi"
   # Keep a copy of the version for the hook's downgrade guard.
@@ -542,7 +646,7 @@ deploy_bios() {
   local src="$1"
   # Only runs when user explicitly opts in AND firmware is BIOS or hybrid.
   log "Deploying Limine BIOS files..."
-  if [[ "$DRY_RUN" -eq 1 ]]; then echo "  (dry-run) cp limine-bios.sys + limine bios-install"; return 0; fi
+  if [[ "$DRY_RUN" -eq 1 ]]; then dry_print "cp limine-bios.sys + limine bios-install"; return 0; fi
   local limine_bin="$src/limine"
   [[ -x "$limine_bin" ]] || die "Host 'limine' tool not built ($limine_bin). Run make in the unpacked dir."
   mkdir -p /boot/limine
@@ -601,7 +705,7 @@ write_default_config() {
   ck="no"; [[ "${DO_CACHYOS:-no}" == "yes" ]] && ck="yes"
   themeid="${DO_THEME_ID:-catppuccin-mocha}"
   theme_valid "$themeid" || themeid="catppuccin-mocha"
-  if [[ "$DRY_RUN" -eq 1 ]]; then echo "  (dry-run) write $CONFIG_FILE"; return 0; fi
+  if [[ "$DRY_RUN" -eq 1 ]]; then dry_print "write $CONFIG_FILE"; return 0; fi
   cat > "$CONFIG_FILE" <<EOF
 # Fedora Limine settings — edit then run: sudo limine-update
 # This mirrors CachyOS /etc/default/limine knobs, translated for Fedora/dracut.
@@ -721,7 +825,7 @@ install_hook_and_sync_script() {
   log "Installing kernel-install hook + sync generator (Fedora equivalent of CachyOS pacman hooks)..."
 
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    echo "  (dry-run) write $SYNC_SCRIPT, $UPDATE_WRAPPER, $HOOK_FILE + /etc/limine/hooks/{pre,post}.d defaults"
+    dry_print "write $SYNC_SCRIPT, $UPDATE_WRAPPER, $HOOK_FILE + /etc/limine/hooks/{pre,post}.d defaults"
     return 0
   fi
 
@@ -1216,10 +1320,10 @@ RWHOOK_EOF
   fi
 
   ok "Hook + sync scripts installed:"
-  echo "  $HOOK_FILE"
-  echo "  $SYNC_SCRIPT"
-  echo "  $UPDATE_WRAPPER  (run this after editing $CONFIG_FILE)"
-  echo "  /etc/limine/hooks/{pre,post}.d  (CachyOS-style boot hooks)"
+  hint "$HOOK_FILE"
+  hint "$SYNC_SCRIPT"
+  hint "$UPDATE_WRAPPER  (run this after editing $CONFIG_FILE)"
+  hint "/etc/limine/hooks/{pre,post}.d  (CachyOS-style boot hooks)"
 }
 
 sync_all_kernels() {
@@ -1259,7 +1363,7 @@ register_efibootmgr() {
   fi
   log "Registering NVRAM entry: $label on $esp_disk part $esp_part ($loader)"
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    echo "  (dry-run) efibootmgr -c -d $esp_disk -p $esp_part -L \"$label\" -l '$loader'"
+    dry_print "efibootmgr -c -d $esp_disk -p $esp_part -L \"$label\" -l '$loader'"
     return 0
   fi
   # Avoid duplicates: delete existing "Limine" entries first.
@@ -1274,8 +1378,8 @@ register_efibootmgr() {
     warn "fallback EFI/BOOT/BOOTX64.EFI will be used if enabled."
     return 0
   }
-  echo "--- Current boot entries ---"
-  efibootmgr -v || true
+  section "Current boot entries"
+  efi_list | ui_indent || true
   # CachyOS UEFI_BOOT_ORDER parity: first = Limine first (GRUB kept as fallback);
   # last/keep = register only, leave the current default boot option alone.
   local _order_policy="first"
@@ -1390,7 +1494,7 @@ sb_ensure_tools() {
   fi
   if [[ "${#missing[@]}" -eq 0 ]]; then return 0; fi
   log "Installing Secure Boot tools (missing: ${missing[*]})..."
-  if [[ "$DRY_RUN" -eq 1 ]]; then echo "  (dry-run) dnf install -y sbsigntools openssl mokutil efitools"; return 0; fi
+  if [[ "$DRY_RUN" -eq 1 ]]; then dry_print "dnf install -y sbsigntools openssl mokutil efitools"; return 0; fi
   run dnf install -y sbsigntools openssl mokutil || die "Failed to install SB tools."
   if [[ "$method" == "custom-db" ]]; then
     run dnf install -y efitools || warn "efitools install failed (needed for db enrollment checks)."
@@ -1404,7 +1508,7 @@ sb_keygen() {
     return 0
   fi
   log "Generating Secure Boot keypair in $dir (CN: $cn)..."
-  if [[ "$DRY_RUN" -eq 1 ]]; then echo "  (dry-run) openssl req + x509 der"; return 0; fi
+  if [[ "$DRY_RUN" -eq 1 ]]; then dry_print "openssl req + x509 der"; return 0; fi
   run mkdir -p "$dir"
   run chmod 700 "$dir"
   run openssl req -new -x509 -newkey rsa:2048 -keyout "$dir/MOK.priv" -out "$dir/MOK.pem" \
@@ -1418,7 +1522,7 @@ sb_keygen() {
 sb_sign_file() {
   local efi="$1" dir="${2:-$SB_KEY_DIR_DEFAULT}"
   [[ -f "$efi" ]] || { warn "sign: missing $efi (skipping)"; return 0; }
-  if [[ "$DRY_RUN" -eq 1 ]]; then echo "  (dry-run) sbsign $efi + sbverify"; return 0; fi
+  if [[ "$DRY_RUN" -eq 1 ]]; then dry_print "sbsign $efi + sbverify"; return 0; fi
   command -v sbsign >/dev/null 2>&1 || { warn "sbsign missing (skipping $efi)"; return 0; }
   # Strip ALL stale signatures first. Re-signing an already-signed binary makes
   # sbsign APPEND ("Image was already signed") and sbverify then fails on the
@@ -1462,7 +1566,7 @@ sb_enroll_and_sign() {
   fi
   [[ -f "$esp/limine.conf" ]] || { warn "no $esp/limine.conf (run limine-update first)"; return 0; }
   local hash efi n=0
-  if [[ "$DRY_RUN" -eq 1 ]]; then echo "  (dry-run) b2sum conf -> enroll-config + sbsign each managed EFI"; return 0; fi
+  if [[ "$DRY_RUN" -eq 1 ]]; then dry_print "b2sum conf -> enroll-config + sbsign each managed EFI"; return 0; fi
   hash="$(b2sum "$esp/limine.conf" | cut -d' ' -f1)"
   [[ "${#hash}" -eq 128 ]] || die "unexpected b2sum length (${#hash})"
   while IFS= read -r efi; do
@@ -1484,7 +1588,7 @@ sb_publish_keys_to_esp() {
   # through mokutil/NVRAM, this copy is for convenience + verification.
   local esp="$1" dir="${2:-$SB_KEY_DIR_DEFAULT}"
   [[ -f "$dir/MOK.der" && -f "$dir/MOK.pem" ]] || { warn "no public key in $dir (skipping ESP publish)"; return 0; }
-  if [[ "$DRY_RUN" -eq 1 ]]; then echo "  (dry-run) publish MOK.{der,pem} -> $esp/EFI/limine/keys/"; return 0; fi
+  if [[ "$DRY_RUN" -eq 1 ]]; then dry_print "publish MOK.{der,pem} -> $esp/EFI/limine/keys/"; return 0; fi
   mkdir -p "$esp/EFI/limine/keys" 2>/dev/null || { warn "cannot create $esp/EFI/limine/keys"; return 0; }
   run cp -f "$dir/MOK.der" "$esp/EFI/limine/keys/MOK.der" || warn "could not publish MOK.der to ESP"
   run cp -f "$dir/MOK.pem" "$esp/EFI/limine/keys/MOK.pem" || warn "could not publish MOK.pem to ESP"
@@ -1497,7 +1601,7 @@ sb_set_config() {
   # Idempotently set SECURE_BOOT / ENABLE_VERIFICATION / ENABLE_ENROLL_CONFIG.
   local method="$1"
   [[ -f "$CONFIG_FILE" ]] || die "No $CONFIG_FILE (run install first)."
-  if [[ "$DRY_RUN" -eq 1 ]]; then echo "  (dry-run) set SECURE_BOOT=$method + verification/enroll yes in $CONFIG_FILE"; return 0; fi
+  if [[ "$DRY_RUN" -eq 1 ]]; then dry_print "set SECURE_BOOT=$method + verification/enroll yes in $CONFIG_FILE"; return 0; fi
   cp -a "$CONFIG_FILE" "$CONFIG_FILE.sb-bak-$(date +%F-%H%M%S)"
   local k
   for k in SECURE_BOOT ENABLE_VERIFICATION ENABLE_ENROLL_CONFIG SB_KEY_DIR; do
@@ -1525,7 +1629,7 @@ sb_deploy_shim_copy() {
   local grub="$esp/EFI/fedora/grubx64.efi" bak="$esp/EFI/fedora/grubx64.efi.grub-bak"
   local src="$esp/EFI/limine/limine_x64.efi"
   [[ -f "$src" ]] || die "No $src (deploy Limine first)."
-  if [[ "$DRY_RUN" -eq 1 ]]; then echo "  (dry-run) backup $grub -> .grub-bak; copy signed $src -> $grub"; return 0; fi
+  if [[ "$DRY_RUN" -eq 1 ]]; then dry_print "backup $grub -> .grub-bak; copy signed $src -> $grub"; return 0; fi
   if [[ -f "$bak" ]]; then
     ok "GRUB backup already exists: $bak (leaving it)."
   elif [[ -f "$grub" ]]; then
@@ -1545,16 +1649,15 @@ sb_restore_shim() {
     warn "No GRUB backup at $bak (nothing to restore)."
     return 0
   fi
-  if [[ "$DRY_RUN" -eq 1 ]]; then echo "  (dry-run) restore $bak -> $grub"; return 0; fi
+  if [[ "$DRY_RUN" -eq 1 ]]; then dry_print "restore $bak -> $grub"; return 0; fi
   run cp -v "$bak" "$grub"
   ok "GRUB restored from backup. (Removing $bak? Keeping it is safer — delete manually.)"
 }
 
 sb_print_mok_instructions() {
   local dir="${1:-$SB_KEY_DIR_DEFAULT}"
+  section "MOK enrollment — one reboot required"
   cat <<EOF
-
-${C_BLD}MOK enrollment — one reboot required:${C_RST}
   Boot order is now: 'Fedora' (shim) first, 'Limine' second (set automatically).
   1. Reboot. Firmware loads shim -> the blue MokManager screen appears.
      (If firmware boots Limine directly instead, use the firmware boot menu
@@ -1585,7 +1688,7 @@ sb_prefer_shim_first() {
   fedora_num="$(efibootmgr 2>/dev/null | grep -i 'fedora' | head -n1 | grep -o '[0-9A-Fa-f]\{4\}' | head -n1 || true)"
   limine_num="$(efibootmgr 2>/dev/null | grep -i 'limine' | head -n1 | grep -o '[0-9A-Fa-f]\{4\}' | head -n1 || true)"
   [[ -n "${fedora_num:-}" ]] || { warn "No 'Fedora' NVRAM entry found (cannot prefer shim first)."; return 0; }
-  if [[ "$DRY_RUN" -eq 1 ]]; then echo "  (dry-run) efibootmgr -o $fedora_num,[limine,]... (shim first)"; return 0; fi
+  if [[ "$DRY_RUN" -eq 1 ]]; then dry_print "efibootmgr -o $fedora_num,[limine,]... (shim first)"; return 0; fi
   order="$(efibootmgr 2>/dev/null | grep '^BootOrder:' | awk '{print $2}' || true)"
   rest="$(echo "$order" | tr ',' '\n' | grep -vi "^$fedora_num\$" | grep -vi "^${limine_num:-XXXX}\$" | paste -sd, - || true)"
   neworder="$fedora_num"
@@ -1597,9 +1700,8 @@ sb_prefer_shim_first() {
 
 sb_print_db_guide() {
   local dir="${1:-$SB_KEY_DIR_DEFAULT}"
+  section "custom-db method — firmware Setup Mode required (advanced)"
   cat <<EOF
-
-${C_BLD}custom-db method — firmware Setup Mode required (advanced):${C_RST}
   Your key ($dir/MOK.pem) must join the firmware signature database.
   1. Reboot into firmware setup. Find Secure Boot options and either:
        - enable 'Setup Mode' / 'Clear Secure Boot Keys', or
@@ -1623,57 +1725,67 @@ sb_status() {
   sb_config_load
   local esp
   esp="$(detect_esp)" || die "ESP not found."
-  echo "${C_BLD}--- Secure Boot status ---${C_RST}"
-  echo "firmware : $(secureboot_state | head -n1)"
-  echo "config   : SECURE_BOOT=$SB_MODE verify=$SB_VERIFY enroll=$SB_ENROLL keys=$SB_KEYS"
-  echo "keys     : $(sb_keys_present "$SB_KEYS" && echo "present ($SB_KEYS/MOK.{priv,pem,der})" || echo "MISSING")"
-  echo "tool     : $(command -v "$LIMINE_TOOL" >/dev/null 2>&1 && echo "$LIMINE_TOOL" || echo "MISSING ($LIMINE_TOOL)")"
-  echo "ESP      : $esp"
-  local efi
-  while IFS= read -r efi; do
-    [[ -n "$efi" ]] || continue
-    printf '  %s\n' "$efi"
-    if command -v sbverify >/dev/null 2>&1 && sb_keys_present "$SB_KEYS"; then
-      sbverify --cert "$SB_KEYS/MOK.pem" "$efi" >/dev/null 2>&1 \
-        && echo "    signature: VALID (our key)" || echo "    signature: NOT ours/unsigned"
-    fi
-  done < <(sb_managed_efis "$esp")
+  section "Secure Boot status"
+  kv "firmware" "$(secureboot_state | head -n1)"
+  kv "config" "SECURE_BOOT=$SB_MODE verify=$SB_VERIFY enroll=$SB_ENROLL keys=$SB_KEYS"
+  kv "keys" "$(sb_keys_present "$SB_KEYS" && echo "present ($SB_KEYS/MOK.{priv,pem,der})" || echo "MISSING")"
+  kv "tool" "$(command -v "$LIMINE_TOOL" >/dev/null 2>&1 && echo "$LIMINE_TOOL" || echo "MISSING ($LIMINE_TOOL)")"
+  kv "ESP" "$esp"
+  local efi efi_files=()
+  mapfile -t efi_files < <(sb_managed_efis "$esp")
+  if [[ ${#efi_files[@]} -gt 0 ]]; then
+    subhead "Managed EFI files"
+    for efi in "${efi_files[@]}"; do
+      [[ -n "$efi" ]] || continue
+      printf '  %s%s%s\n' "$C_GRY" "$efi" "$C_RST"
+      if command -v sbverify >/dev/null 2>&1 && sb_keys_present "$SB_KEYS"; then
+        if sbverify --cert "$SB_KEYS/MOK.pem" "$efi" >/dev/null 2>&1; then
+          printf '    %s signature:%s VALID (our key)\n' "$C_GRN" "$C_RST"
+        else
+          printf '    %s signature:%s NOT ours / unsigned\n' "$C_YLW" "$C_RST"
+        fi
+      fi
+    done
+  fi
+  subhead "Config"
   if [[ -f "$esp/limine.conf" ]]; then
-    echo "conf b2 : $(b2sum "$esp/limine.conf" | cut -d' ' -f1 | cut -c1-32)… (full in log)"
-    grep -c '#[0-9a-fA-F]\{64,\}' "$esp/limine.conf" | xargs echo "hashed paths:"
+    kv "b2sum" "$(b2sum "$esp/limine.conf" | cut -d' ' -f1 | cut -c1-32)… (full in log)"
+    kv "hashed paths" "$(grep -c '#[0-9a-fA-F]\{64,\}' "$esp/limine.conf" 2>/dev/null || echo 0)"
   else
-    echo "conf     : MISSING ($esp/limine.conf)"
+    kv "conf" "MISSING ($esp/limine.conf)"
   fi
   if [[ -f "$esp/EFI/fedora/grubx64.efi.grub-bak" ]]; then
-    echo "shim     : GRUB backup present (mok-shim copy active or was active)"
+    kv "shim" "GRUB backup present (mok-shim copy active or was active)"
   fi
   if command -v mokutil >/dev/null 2>&1 && sb_keys_present "$SB_KEYS"; then
+    subhead "Enrollment"
     local mok_out
     mok_out="$(mokutil --test-key "$SB_KEYS/MOK.der" 2>&1 || true)"
     if echo "$mok_out" | grep -q "is enrolled"; then
-      echo "mok      : ENROLLED (firmware trusts our key)"
+      kv "mok" "ENROLLED (firmware trusts our key)"
     elif echo "$mok_out" | grep -q "is not enrolled"; then
       if mokutil --list-new 2>/dev/null | grep -qiE 'certificate|issuer'; then
-        echo "mok      : PENDING (reboot via the 'Fedora'/shim entry to complete in MokManager)"
+        kv "mok" "PENDING (reboot via the 'Fedora'/shim entry to finish in MokManager)"
       else
-        echo "mok      : NOT enrolled (run --sb-setup=mok-shim, then reboot via shim)"
+        kv "mok" "NOT enrolled (run --sb-setup=mok-shim, then reboot via shim)"
       fi
     else
-      echo "mok      : unknown (mokutil output unclear)"
+      kv "mok" "unknown (mokutil output unclear)"
     fi
     if [[ -f "$esp/EFI/limine/keys/MOK.der" ]]; then
-      echo "mok-esp  : published ($esp/EFI/limine/keys/MOK.{der,pem})"
+      kv "mok-esp" "published ($esp/EFI/limine/keys/MOK.{der,pem})"
     else
-      echo "mok-esp  : not published (re-run --sb-resign)"
+      kv "mok-esp" "not published (re-run --sb-resign)"
     fi
   fi
   nvidia_detect
   if [[ "$NVIDIA_PRESENT" -eq 1 ]]; then
-    echo "nvidia   : $NVIDIA_SRC ${NVIDIA_VER:-} (signer: ${NVIDIA_SIGNER:-?}, key enrolled: $NVIDIA_ENROLLED)"
+    subhead "NVIDIA"
+    kv "driver" "$NVIDIA_SRC ${NVIDIA_VER:-} (signer: ${NVIDIA_SIGNER:-?}, key enrolled: $NVIDIA_ENROLLED)"
     if [[ "$NVIDIA_SRC" == "dkms" ]]; then
       local dkms_cn
       dkms_cn="$(grep '^mok_certificate=' "$DKMS_CONF" 2>/dev/null | cut -d'"' -f2 || true)"
-      echo "dkms key : ${dkms_cn:-default /var/lib/dkms/mok.pub}"
+      kv "dkms key" "${dkms_cn:-default /var/lib/dkms/mok.pub}"
     fi
   fi
 }
@@ -1743,15 +1855,15 @@ sb_setup_mok() {
   sb_prefer_shim_first "$esp"
   echo
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    echo "  (dry-run) mokutil --import $SB_KEYS/MOK.der"
+    dry_print "mokutil --import $SB_KEYS/MOK.der"
   elif [[ "$ASSUME_YES" -eq 1 ]]; then
     warn "--yes: skipping mokutil --import (needs a password + reboot). Run manually:"
-    echo "  sudo mokutil --import $SB_KEYS/MOK.der"
+    hint "sudo mokutil --import $SB_KEYS/MOK.der"
   else
-    echo "Set a MOK password (you will enter it ONCE in MokManager on next boot):"
+    subhead "Set a MOK password (you will enter it ONCE in MokManager on next boot):"
     local import_out
     import_out="$(run mokutil --import "$SB_KEYS/MOK.der" 2>&1 || true)"
-    echo "$import_out"
+    printf '%s\n' "$import_out" | ui_indent
     if echo "$import_out" | grep -qi "already in the enrollment request"; then
       warn "MOK.der was already queued by an earlier run — your FIRST password still applies."
       warn "Forgot it? sudo mokutil --reset, reboot, then re-run: sudo $0 --sb-setup=mok-shim"
@@ -1802,13 +1914,11 @@ sb_setup_flow() {
       method="mok-shim"
       warn "--yes: defaulting to mok-shim WITHOUT MOK import (run mokutil --import manually)."
     else
-      echo
-      echo "${C_BLD}--- Secure Boot setup ---${C_RST}"
-      echo "  mok-shim   MOK key + shim chainload. No firmware Setup Mode. (Recommended)"
-      echo "  custom-db  Enroll key into firmware db in Setup Mode. No shim. (Advanced)"
-      echo "  no         Cancel."
       local mc
-      mc="$(ask_numbered "Method" "mok-shim (recommended)" "custom-db (advanced)" "no (cancel)")"
+      mc="$(ask_numbered "Secure Boot setup — pick a method" \
+        "mok-shim — MOK key + shim chainload, no firmware Setup Mode (recommended)" \
+        "custom-db — enroll key into firmware db in Setup Mode, no shim (advanced)" \
+        "no — cancel")"
       case "$mc" in
         1) method="mok-shim" ;;
         2) method="custom-db" ;;
@@ -1830,14 +1940,12 @@ secureboot_menu() {
   # Wizard choice. Sets DO_SECUREBOOT (no|mok-shim|custom-db). Never enrolls here.
   # Preserves a pre-seeded method from the CachyOS kernel flow (no double-ask).
   if [[ "${DO_SECUREBOOT:-no}" == "mok-shim" || "${DO_SECUREBOOT:-no}" == "custom-db" ]]; then
-    echo
-    echo "${C_BLD}--- Secure Boot ---${C_RST}"
-    echo "Secure Boot method already set: $DO_SECUREBOOT (from CachyOS kernel setup)."
+    section "Secure Boot"
+    kv "method" "$DO_SECUREBOOT (already chosen in CachyOS kernel setup)"
     return 0
   fi
-  echo
-  echo "${C_BLD}--- Secure Boot ---${C_RST}"
-  echo "Firmware reports: $SB_STATE. Unsigned Limine boots only with SB off."
+  section "Secure Boot"
+  echo "  Firmware reports: $SB_STATE. Unsigned Limine boots only with SB off."
   if [[ "$ASSUME_YES" -eq 1 ]]; then
     DO_SECUREBOOT="no"
     warn "--yes: Secure Boot stays unsigned (key enrollment needs interaction)."
@@ -1904,18 +2012,19 @@ nvidia_detect() {
 
 nvidia_preflight_report() {
   nvidia_detect
-  echo "--- NVIDIA ---"
   if [[ "$NVIDIA_PRESENT" -eq 0 ]]; then
-    echo "No NVIDIA GPU detected (lspci) — skipping."
+    section "NVIDIA"
+    hint "No NVIDIA GPU detected (lspci) — nothing to do here."
     return 0
   fi
-  echo "GPU+driver: $NVIDIA_SRC ${NVIDIA_VER:-} (signer: ${NVIDIA_SIGNER:-none/unsigned})"
-  echo "DKMS modules: ${NVIDIA_DKMS_MODS:-none}"
-  echo "module key : ${NVIDIA_KEY:-none} (enrolled: $NVIDIA_ENROLLED)"
-  echo "lockdown   : $(cat /sys/kernel/security/lockdown 2>/dev/null || echo n/a)"
+  section "NVIDIA"
+  kv "driver" "$NVIDIA_SRC ${NVIDIA_VER:-} (signer: ${NVIDIA_SIGNER:-none/unsigned})"
+  kv "dkms mods" "${NVIDIA_DKMS_MODS:-none}"
+  kv "module key" "${NVIDIA_KEY:-none} (enrolled: $NVIDIA_ENROLLED)"
+  kv "lockdown" "$(cat /sys/kernel/security/lockdown 2>/dev/null || echo n/a)"
   if [[ "$NVIDIA_ENROLLED" == "no" ]]; then
     warn "NVIDIA/DKMS key NOT enrolled: enabling SB now = black screen + no WiFi until fixed."
-    echo "  The SB setup offers one-key unification (recommended)."
+    hint "The Secure Boot setup offers one-key unification (recommended)."
   fi
 }
 
@@ -1924,18 +2033,18 @@ nvidia_menu() {
   DO_NVIDIA="skip"
   nvidia_detect
   if [[ "$NVIDIA_PRESENT" -eq 0 ]]; then return 0; fi
-  echo
-  echo "${C_BLD}--- NVIDIA Secure Boot ---${C_RST}"
-  echo "Driver: $NVIDIA_SRC $NVIDIA_VER (modules signed by '${NVIDIA_SIGNER:-?}', key enrolled: $NVIDIA_ENROLLED)"
+  section "NVIDIA Secure Boot"
+  kv "driver" "$NVIDIA_SRC $NVIDIA_VER (signer: ${NVIDIA_SIGNER:-?}, key enrolled: $NVIDIA_ENROLLED)"
   if [[ "$NVIDIA_SRC" == "dkms" ]]; then
-    echo "Plan: point DKMS at your Limine MOK ($SB_KEYS), rebuild modules for"
-    echo "all kernels, enroll once (covers Limine + NVIDIA + WiFi DKMS modules)."
+    bullet "Point DKMS at your Limine MOK ($SB_KEYS)"
+    bullet "Rebuild modules for every installed kernel"
+    bullet "One enrollment covers Limine + NVIDIA + WiFi DKMS modules"
     local ans
     if [[ "$ASSUME_YES" -eq 1 ]]; then ans="yes"; else ans="$(ask_yes_no "Unify DKMS signing key?" "yes")"; fi
     [[ "$ans" == "yes" ]] && DO_NVIDIA="unify" || DO_NVIDIA="skip"
   elif [[ "$NVIDIA_SRC" == "rpm-akmods" ]]; then
-    echo "RPM Fusion akmods uses its own key ($NVIDIA_KEY). Plan: enroll it"
-    echo "alongside the Limine MOK in the same MokManager session (two imports)."
+    bullet "RPM Fusion akmods uses its own key ($NVIDIA_KEY)"
+    bullet "Enroll it alongside the Limine MOK in the same MokManager session"
     local ans
     if [[ "$ASSUME_YES" -eq 1 ]]; then ans="yes"; else ans="$(ask_yes_no "Enroll akmods key too?" "yes")"; fi
     [[ "$ans" == "yes" ]] && DO_NVIDIA="enroll-akmods" || DO_NVIDIA="skip"
@@ -1954,7 +2063,7 @@ nvidia_unify_key() {
     ok "DKMS already points at Limine key (marker present)."
     return 0
   fi
-  if [[ "$DRY_RUN" -eq 1 ]]; then echo "  (dry-run) backup $DKMS_CONF + set mok_signing_key/certificate"; return 0; fi
+  if [[ "$DRY_RUN" -eq 1 ]]; then dry_print "backup $DKMS_CONF + set mok_signing_key/certificate"; return 0; fi
   run cp -a "$DKMS_CONF" "$DKMS_CONF.limine-bak-$(date +%F-%H%M%S)"
   # Drop conflicting lines, then append ours (last assignment wins in DKMS).
   run sed -i '/^mok_signing_key=/d; /^mok_certificate=/d' "$DKMS_CONF"
@@ -1982,7 +2091,7 @@ nvidia_rebuild_all() {
     ver="$(basename "$(dirname "$b")")"
     if nvidia_needs_rebuild "$ver" "$expect"; then
       log "DKMS rebuild for $ver (nvidia: missing or wrong signer)..."
-      if [[ "$DRY_RUN" -eq 1 ]]; then echo "  (dry-run) dkms autoinstall -k $ver"; continue; fi
+      if [[ "$DRY_RUN" -eq 1 ]]; then dry_print "dkms autoinstall -k $ver"; continue; fi
       run dkms autoinstall -k "$ver" || warn "dkms autoinstall failed for $ver (see dkms status)"
       built=$((built + 1))
     else
@@ -1990,7 +2099,7 @@ nvidia_rebuild_all() {
     fi
   done
   ok "DKMS rebuild done (rebuilt: $built, already-good: $skipped)."
-  if [[ "$DRY_RUN" -eq 0 ]]; then dkms status 2>/dev/null | head -n 10 || true; fi
+  if [[ "$DRY_RUN" -eq 0 ]]; then dkms status 2>/dev/null | head -n 10 | ui_indent || true; fi
 }
 
 nvidia_verify() {
@@ -1999,9 +2108,9 @@ nvidia_verify() {
   for b in /lib/modules/*/build; do
     ver="$(basename "$(dirname "$b")")"
     f="$(find "/lib/modules/$ver/extra" -name 'nvidia.ko*' 2>/dev/null | head -n1 || true)"
-    if [[ -z "$f" ]]; then echo "  $ver: no nvidia module"; continue; fi
+    if [[ -z "$f" ]]; then printf '  %s%s: no nvidia module%s\n' "$C_DIM" "$ver" "$C_RST"; continue; fi
     s="$(modinfo -F signer "$f" 2>/dev/null || echo ERROR)"
-    echo "  $ver: signer='$s'"
+    printf '  %s: signer=%s%s%s\n' "$ver" "'" "$s" "'"
   done
 }
 
@@ -2013,7 +2122,7 @@ dkms_esp_hook_install() {
     ok "DKMS ESP hook already present."
     return 0
   fi
-  if [[ "$DRY_RUN" -eq 1 ]]; then echo "  (dry-run) append limine sync to post_transaction in $DKMS_CONF"; return 0; fi
+  if [[ "$DRY_RUN" -eq 1 ]]; then dry_print "append limine sync to post_transaction in $DKMS_CONF"; return 0; fi
   # Backup once (ls-test avoids [[ -f glob ]] multi-match hazards).
   ls "$DKMS_CONF".limine-bak-* >/dev/null 2>&1 || run cp -a "$DKMS_CONF" "$DKMS_CONF.limine-bak-$(date +%F-%H%M%S)"
   if grep -q '^post_transaction=' "$DKMS_CONF"; then
@@ -2032,7 +2141,7 @@ dkms_esp_hook_install() {
 
 dkms_esp_hook_remove() {
   if grep -q 'limine-esp-sync' "$DKMS_CONF" 2>/dev/null; then
-    if [[ "$DRY_RUN" -eq 1 ]]; then echo "  (dry-run) remove limine lines from $DKMS_CONF"; return 0; fi
+    if [[ "$DRY_RUN" -eq 1 ]]; then dry_print "remove limine lines from $DKMS_CONF"; return 0; fi
     local bak
     bak="$(ls -t "$DKMS_CONF.limine-bak-"* 2>/dev/null | head -n1 || true)"
     if [[ -n "$bak" ]]; then
@@ -2057,7 +2166,7 @@ nvidia_sb_setup() {
       ;;
     enroll-akmods)
       if [[ "$DRY_RUN" -eq 1 ]]; then
-        echo "  (dry-run) mokutil --import $NVIDIA_KEY"
+        dry_print "mokutil --import $NVIDIA_KEY"
       elif [[ "$ASSUME_YES" -eq 1 ]]; then
         warn "--yes: run manually: sudo mokutil --import $NVIDIA_KEY"
       else
@@ -2089,7 +2198,7 @@ cachyos_sign_kernel() {
     return 0
   fi
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    echo "  (dry-run) sbsign $kpath"
+    dry_print "sbsign $kpath"
     return 0
   fi
   command -v sbsign >/dev/null 2>&1 || { warn "sbsign missing — cannot sign $kpath"; return 0; }
@@ -2119,7 +2228,7 @@ cachyos_sign_all() {
 # Install kernel-install hook that auto-signs CachyOS kernels on every update.
 cachyos_hook_install() {
   local hook="/etc/kernel/install.d/94-cachyos-sign.install"
-  [[ "$DRY_RUN" -eq 1 ]] && { echo "  (dry-run) write $hook"; return 0; }
+  [[ "$DRY_RUN" -eq 1 ]] && { dry_print "write $hook"; return 0; }
   cat > "$hook" <<'HOOK_EOF'
 #!/usr/bin/env bash
 # 94-cachyos-sign.install — Auto-sign CachyOS kernels on every kernel install/update.
@@ -2151,11 +2260,10 @@ cachyos_menu() {
   DO_CACHYOS="no"
   cachyos_detect || true
   [[ "${CACHYOS_PRESENT:-0}" -eq 1 ]] || return 0
-  echo
-  echo "${C_BLD}--- CachyOS kernel Secure Boot signing ---${C_RST}"
-  echo "Detected CachyOS kernel(s): $CACHYOS_KERNELS"
-  echo "COPR CachyOS kernels are unsigned and will NOT boot with Secure Boot on"
-  echo "(Fedora's Microsoft-signed shim rejects them: 'bad shim signature')."
+  section "CachyOS kernel Secure Boot signing"
+  kv "detected" "${CACHYOS_KERNELS//$'\n'/ }"
+  warn "CachyOS kernels are unsigned — Fedora's shim rejects them under Secure Boot"
+  hint "('bad shim signature') unless you self-sign them with a MOK key."
   if [[ "$ASSUME_YES" -eq 1 ]]; then
     warn "--yes: CachyOS kernel signing skipped."
     return 0
@@ -2171,16 +2279,14 @@ cachyos_install_menu() {
   # --yes keeps defaults: no install, no signing.
   DO_CACHYOS_INSTALL=0
   [[ "${DO_CACHYOS:-no}" == "yes" ]] || DO_CACHYOS="no"
-  echo
-  echo "${C_BLD}--- CachyOS kernel (COPR, optional) ---${C_RST}"
+  section "CachyOS kernel (COPR, optional)"
   cachyos_detect || true
   if [[ "${CACHYOS_PRESENT:-0}" -eq 1 ]]; then
-    echo "Detected CachyOS kernel(s) already installed:"
-    echo "  $CACHYOS_KERNELS"
+    kv "installed" "${CACHYOS_KERNELS//$'\n'/ }"
   else
-    echo "Install kernel-cachyos (+ -core, -modules, -devel-matched) from COPR?"
-    echo "  sudo dnf copr enable bieszczaders/kernel-cachyos"
-    echo "  sudo dnf install kernel-cachyos kernel-cachyos-devel-matched"
+    echo "  Install kernel-cachyos (+ -core, -modules, -devel-matched) from COPR?"
+    hint "sudo dnf copr enable bieszczaders/kernel-cachyos"
+    hint "sudo dnf install kernel-cachyos kernel-cachyos-devel-matched"
     if [[ "$ASSUME_YES" -eq 1 ]]; then return 0; fi
     local r
     r="$(ask_yes_no "Install CachyOS kernel from COPR?" "no")"
@@ -2191,15 +2297,13 @@ cachyos_install_menu() {
   if [[ "$ASSUME_YES" -eq 1 ]]; then return 0; fi
   local want_sign="no" def="no"
   if [[ "${SB_STATE:-unknown}" == "enabled" ]]; then
-    echo
     warn "Secure Boot is ENABLED and COPR CachyOS kernels are UNSIGNED."
-    echo "  Fedora's shim will reject them ('bad shim signature') unless you:"
-    echo "    - disable Secure Boot in firmware (easiest), or"
-    echo "    - self-sign via MOK (recommended: one enrollment, auto-signs on updates)."
+    hint "Fedora's shim will reject them ('bad shim signature') unless you:"
+    hint "• disable Secure Boot in firmware (easiest), or"
+    hint "• self-sign via MOK (recommended: one enrollment, auto-signs on updates)"
     def="yes"
   else
-    echo "CachyOS kernels are unsigned. With Secure Boot off they boot as-is;"
-    echo "with Secure Boot on they need MOK self-signing."
+    hint "CachyOS kernels are unsigned: fine with Secure Boot off, they need MOK self-signing when it's on."
     def="no"
   fi
   want_sign="$(ask_yes_no "Self-sign CachyOS kernel(s) with MOK + auto-sign on updates?" "$def")"
@@ -2207,9 +2311,9 @@ cachyos_install_menu() {
     DO_CACHYOS="yes"
     if [[ "${DO_SECUREBOOT:-no}" == "no" ]]; then
       DO_SECUREBOOT="mok-shim"
-      echo "Secure Boot method set to mok-shim (covers Limine + CachyOS kernel, one MOK)."
+      ok "Secure Boot method set to mok-shim (covers Limine + CachyOS kernel, one MOK)."
     fi
-    echo "On the next boot, MokManager (blue screen): Enroll MOK -> Continue -> Yes."
+    hint "Next boot: MokManager (blue screen) → Enroll MOK → Continue → Yes."
   else
     DO_CACHYOS="no"
     if [[ "${SB_STATE:-unknown}" == "enabled" ]]; then
@@ -2223,8 +2327,8 @@ install_cachyos_kernel() {
   [[ "${DO_CACHYOS_INSTALL:-0}" -eq 1 ]] || return 0
   log "Installing CachyOS kernel from COPR (bieszczaders/kernel-cachyos)..."
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    echo "  (dry-run) dnf copr enable -y bieszczaders/kernel-cachyos"
-    echo "  (dry-run) dnf install -y kernel-cachyos kernel-cachyos-core kernel-cachyos-modules kernel-cachyos-devel-matched"
+    dry_print "dnf copr enable -y bieszczaders/kernel-cachyos"
+    dry_print "dnf install -y kernel-cachyos kernel-cachyos-core kernel-cachyos-modules kernel-cachyos-devel-matched"
     return 0
   fi
   run dnf copr enable -y bieszczaders/kernel-cachyos \
@@ -2470,7 +2574,7 @@ config_set_key() {
   # config_set_key <file> <KEY> <value> — idempotent KEY="value" setter.
   local f="$1" k="$2" v="$3"
   [[ -f "$f" ]] || die "No $f (run install first)."
-  if [[ "$DRY_RUN" -eq 1 ]]; then echo "  (dry-run) set $k=\"$v\" in $f"; return 0; fi
+  if [[ "$DRY_RUN" -eq 1 ]]; then dry_print "set $k=\"$v\" in $f"; return 0; fi
   if grep -q "^$k=" "$f"; then
     run sed -i "s|^$k=.*|$k=\"$v\"|" "$f"
   else
@@ -2485,7 +2589,7 @@ fetch_theme() {
   local id="$1" esp="$2" url line aurl dest
   theme_valid "$id" || { warn "Unknown theme: $id"; return 1; }
   if [[ "$id" == "none" ]]; then
-    if [[ "$DRY_RUN" -eq 1 ]]; then echo "  (dry-run) theme=none (remove $THEME_SNIPPET)"; return 0; fi
+    if [[ "$DRY_RUN" -eq 1 ]]; then dry_print "theme=none (remove $THEME_SNIPPET)"; return 0; fi
     rm -f "$THEME_SNIPPET" 2>/dev/null || true
     config_set_key "$CONFIG_FILE" "THEME_NAME" "none"
     ok "Theme cleared (generator defaults)."
@@ -2493,7 +2597,7 @@ fetch_theme() {
   fi
   log "Fetching theme: $id ($(theme_desc "$id")) ..."
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    echo "  (dry-run) snippet -> $THEME_SNIPPET; assets -> $esp/"
+    dry_print "snippet -> $THEME_SNIPPET; assets -> $esp/"
     return 0
   fi
   local tmp
@@ -2532,11 +2636,9 @@ fetch_theme() {
 
 theme_menu() {
   # Wizard choice. Sets DO_THEME_ID (never downloads here).
-  echo
-  echo "${C_BLD}--- Boot theme ---${C_RST}"
-  echo "Catppuccin Mocha is the default. A theme sets palette, interface"
-  echo "colours, wallpaper and font. Applied before kernels sync; every"
-  echo "later regen keeps it (switch anytime: sudo \$0 --theme)."
+  section "Boot theme"
+  hint "Catppuccin Mocha is the default. A theme sets palette, colours, wallpaper and font."
+  hint "Applied before the kernel sync; switch anytime with:  sudo $0 --theme"
   if [[ "$ASSUME_YES" -eq 1 ]]; then
     DO_THEME_ID="catppuccin-mocha"
     return 0
@@ -2604,9 +2706,11 @@ install_state_summary() {
   INSTALL_DATE="${INSTALL_DATE:-?}"; LAST_UPDATE="${LAST_UPDATE:-?}"
   LIMINE_VER_S="${LIMINE_VER:-?}"; ESP_S="${ESP:-?}"
   THEME_NAME_S="${THEME_NAME:-?}"; SECURE_BOOT_S="${SECURE_BOOT:-?}"
-  echo "  installed : $INSTALL_DATE   last change: $LAST_UPDATE"
-  echo "  limine    : $LIMINE_VER_S   esp: $ESP_S"
-  echo "  theme     : $THEME_NAME_S   secure boot: $SECURE_BOOT_S"
+  kv "installed" "$INSTALL_DATE   (last change: $LAST_UPDATE)"
+  kv "limine" "$LIMINE_VER_S"
+  kv "ESP" "$ESP_S"
+  kv "theme" "$THEME_NAME_S"
+  kv "secure boot" "$SECURE_BOOT_S"
 }
 
 write_install_state() {
@@ -2614,7 +2718,7 @@ write_install_state() {
   # Preserves INSTALL_DATE + LIMINE_VER ("keep") across re-runs.
   local ver="${1:-keep}" now old_date="?" old_ver="?"
   now="$(date +%F-%H%M%S)"
-  if [[ "$DRY_RUN" -eq 1 ]]; then echo "  (dry-run) write $STATE_FILE"; return 0; fi
+  if [[ "$DRY_RUN" -eq 1 ]]; then dry_print "write $STATE_FILE"; return 0; fi
   if [[ -f "$STATE_FILE" ]]; then
     old_date="$(grep '^INSTALL_DATE=' "$STATE_FILE" 2>/dev/null | cut -d'"' -f2 || true)"
     old_ver="$(grep '^LIMINE_VER=' "$STATE_FILE" 2>/dev/null | cut -d'"' -f2 || true)"
@@ -2696,7 +2800,7 @@ install_snapper_suite() {
   # $1 = ESP (generators resolve it from /etc/default/limine at runtime).
   log "Installing limine-snapper-sync suite (Fedora port of CachyOS tooling)..."
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    echo "  (dry-run) write $SNAP_SYNC_TOOL, $SNAP_LIST_TOOL, $SNAP_RESTORE_TOOL, $SNAP_PLUGIN, systemd service+path"
+    dry_print "write $SNAP_SYNC_TOOL, $SNAP_LIST_TOOL, $SNAP_RESTORE_TOOL, $SNAP_PLUGIN, systemd service+path"
     return 0
   fi
 
@@ -2994,22 +3098,21 @@ snapper_suite_uninstall() {
 # ---------------------------------------------------------------- extras ----
 
 extras_menu() {
-  echo
-  echo "${C_BLD}--- Optional extras (CachyOS full-suite parity) ---${C_RST}"
-  echo "All optional. Defaults in [brackets]. Non-interactive (--yes) picks defaults."
+  section "Optional extras (CachyOS full-suite parity)"
+  hint "All optional. Defaults in [brackets]; --yes picks the defaults."
 
   local r
   r="$(ask_yes_no "Install memtest86+ + add menu entry?" "yes")"; [[ "$r" == "yes" ]] && DO_MEMTEST=1 || DO_MEMTEST=0
   r="$(ask_yes_no "Install EDK2 UEFI Shell + add menu entry?" "no")";  [[ "$r" == "yes" ]] && DO_SHELL=1 || DO_SHELL=0
   r="$(ask_yes_no "Enable snapper/BTRFS snapshot entries if BTRFS?" "yes")"; [[ "$r" == "yes" ]] && DO_SNAPSHOTS="auto" || DO_SNAPSHOTS="no"
-  echo "Boot theme is chosen in the next step (separate theme menu)."
+  hint "Boot theme is chosen in the next step (separate theme menu)."
 }
 
 install_extras() {
   local esp="$1"
   if [[ "$DO_MEMTEST" -eq 1 ]]; then
     log "Installing memtest86+..."
-    if [[ "$DRY_RUN" -eq 1 ]]; then echo "  (dry-run) dnf install memtest86+ + copy to ESP"; else
+    if [[ "$DRY_RUN" -eq 1 ]]; then dry_print "dnf install memtest86+ + copy to ESP"; else
       dnf install -y memtest86+ 2>/dev/null || warn "memtest86+ install failed (skipping)."
       # Fedora layout: /usr/lib64/memtest86+/memtest86+x64.efi (also /usr/share/memtest86+/*.iso)
       local m
@@ -3024,7 +3127,7 @@ install_extras() {
   fi
   if [[ "$DO_SHELL" -eq 1 ]]; then
     log "Installing EDK2 shell..."
-    if [[ "$DRY_RUN" -eq 1 ]]; then echo "  (dry-run) dnf install edk2-shell-x64 + copy Shell.efi"; else
+    if [[ "$DRY_RUN" -eq 1 ]]; then dry_print "dnf install edk2-shell-x64 + copy Shell.efi"; else
       dnf install -y edk2-shell-x64 2>/dev/null || warn "edk2-shell-x64 install failed (skipping)."
       # Fedora layout: /usr/share/edk2/ovmf/Shell.efi
       local s
@@ -3044,7 +3147,7 @@ install_extras() {
       warn "Root is $rootfs (not btrfs) — snapshot entries skipped (nothing to do)."
     else
       log "Setting up snapper snapshot support (BTRFS detected)..."
-      if [[ "$DRY_RUN" -eq 1 ]]; then echo "  (dry-run) dnf install snapper btrfs-progs + snapshot suite"; else
+      if [[ "$DRY_RUN" -eq 1 ]]; then dry_print "dnf install snapper btrfs-progs + snapshot suite"; else
         dnf install -y snapper btrfs-progs inotify-tools 2>/dev/null || warn "snapper install failed."
         if ! snapper list-configs 2>/dev/null | awk 'NR>1 {found=1} END {exit !found}'; then
           warn "No snapper config yet. Create one for / (e.g. snapper -c root create-config /),"
@@ -3070,7 +3173,7 @@ do_backup() {
   ts="$(date +%F-%H%M%S)"
   dest="$BACKUP_ROOT/$ts"
   log "Backing up to $dest ..."
-  if [[ "$DRY_RUN" -eq 1 ]]; then echo "  (dry-run) backup ESP EFI dirs + /boot/loader + efibootmgr -v"; return 0; fi
+  if [[ "$DRY_RUN" -eq 1 ]]; then dry_print "backup ESP EFI dirs + /boot/loader + efibootmgr -v"; return 0; fi
   mkdir -p "$dest"
   efibootmgr -v > "$dest/efibootmgr-v.txt" 2>&1 || true
   cp -a /etc/kernel/cmdline "$dest/kernel-cmdline.txt" 2>/dev/null || echo "(no /etc/kernel/cmdline)" > "$dest/kernel-cmdline.txt"
@@ -3099,17 +3202,14 @@ do_backup() {
 
 verify_install() {
   local esp="$1"
-  echo
-  echo "${C_BLD}--- Verify ---${C_RST}"
-  echo "ESP contents:"
-  ls -lh "$esp/EFI/limine/" 2>/dev/null || warn "missing $esp/EFI/limine/"
-  ls -lh "$esp/$MACHINE/" 2>/dev/null || ls -lh "$esp/$(machine_id)/" 2>/dev/null || warn "no per-machine kernel dir yet"
-  echo
-  echo "limine.conf (first 60 lines):"
-  head -n 60 "$esp/limine.conf" 2>/dev/null || warn "no $esp/limine.conf"
-  echo
-  efibootmgr 2>/dev/null || warn "efibootmgr unavailable"
-  echo
+  section "Verify"
+  subhead "ESP contents"
+  ls -lh "$esp/EFI/limine/" 2>/dev/null | ui_indent || warn "missing $esp/EFI/limine/"
+  ls -lh "$esp/$MACHINE/" 2>/dev/null | ui_indent || ls -lh "$esp/$(machine_id)/" 2>/dev/null | ui_indent || warn "no per-machine kernel dir yet"
+  subhead "limine.conf (first 60 lines)"
+  head -n 60 "$esp/limine.conf" 2>/dev/null | ui_indent || warn "no $esp/limine.conf"
+  subhead "Boot entries"
+  efi_list | ui_indent || warn "efibootmgr unavailable"
   if [[ -f "$esp/EFI/limine/limine_x64.efi" && -f "$esp/limine.conf" ]]; then
     ok "Limine looks deployed. Next: reboot, pick 'Limine' (or it boots first), test ALL kernels."
   else
@@ -3120,87 +3220,87 @@ verify_install() {
     local sbmode hashed
     sbmode="$(grep '^SECURE_BOOT=' "$CONFIG_FILE" 2>/dev/null | cut -d'"' -f2 || true)"
     if [[ -n "${sbmode:-}" && "$sbmode" != "no" ]]; then
-      echo
-      echo "Secure Boot ($sbmode): firmware reports $(secureboot_state | head -n1)"
+      section "Secure Boot ($sbmode)"
+      kv "firmware" "$(secureboot_state | head -n1)"
       hashed="$(grep -c '#[0-9a-fA-F]\{64,\}' "$esp/limine.conf" 2>/dev/null || true)"
-      echo "  hashed paths in limine.conf: $hashed"
+      kv "hashed paths" "${hashed:-0} in limine.conf"
       local keydir
       keydir="$(grep '^SB_KEY_DIR=' "$CONFIG_FILE" 2>/dev/null | cut -d'"' -f2 || true)"
       [[ -z "${keydir:-}" ]] && keydir="$SB_KEY_DIR_DEFAULT"
       if [[ -f "$keydir/MOK.pem" ]] && command -v sbverify >/dev/null 2>&1; then
         if sbverify --cert "$keydir/MOK.pem" "$esp/EFI/limine/limine_x64.efi" >/dev/null 2>&1; then
-          ok "  signature on limine_x64.efi: VALID (our key)"
+          ok "Signature on limine_x64.efi: VALID (our key)"
         else
-          warn "  signature on limine_x64.efi: NOT valid with our key (re-run --sb-resign)"
+          warn "Signature on limine_x64.efi: NOT valid with our key (re-run --sb-resign)"
         fi
       else
-        warn "  cannot verify signature (keys/sbverify missing)"
+        warn "Cannot verify signature (keys/sbverify missing)"
       fi
-      [[ "$sbmode" == "mok-shim" && -f "$esp/EFI/fedora/grubx64.efi.grub-bak" ]] \
-        && echo "  shim chain: active (real GRUB in .grub-bak)" \
-        || echo "  shim chain: no GRUB backup (direct boot only)"
+      if [[ "$sbmode" == "mok-shim" && -f "$esp/EFI/fedora/grubx64.efi.grub-bak" ]]; then
+        kv "shim chain" "active (real GRUB in .grub-bak)"
+      else
+        kv "shim chain" "no GRUB backup (direct boot only)"
+      fi
       nvidia_detect
       if [[ "$NVIDIA_PRESENT" -eq 1 ]]; then
-        echo "  nvidia module: ${NVIDIA_SIGNER:-unsigned?} (key enrolled: $NVIDIA_ENROLLED)"
+        kv "nvidia module" "${NVIDIA_SIGNER:-unsigned?} (key enrolled: $NVIDIA_ENROLLED)"
       fi
     fi
   fi
 }
 
 print_next_steps() {
-  cat <<EOF
-
-${C_BLD}Next steps (read this!):${C_RST}
-  1. Reboot. Limine should be first in boot order; old Fedora/GRUB entry is kept.
-  2. Test every kernel entry in Limine. Keep GRUB until you're sure.
-  3. Kernel updates: automatic via $HOOK_FILE (runs limine-fedora-sync).
-     After editing $CONFIG_FILE, run:  sudo limine-update
-  4. Rollback any time: firmware boot menu -> pick "Fedora" (GRUB),
-     or: sudo efibootmgr -o <fedora-num>,<limine-num>
-     Full uninstall: sudo $0 --uninstall
-  5. (Optional) Only when Limine is proven: remove GRUB (see README "Removing GRUB").
-     Do NOT remove shim/grub blindly — they are dnf-protected for a reason.
-EOF
+  local n1="${C_CYN}${C_BLD}1.${C_RST}" n2="${C_CYN}${C_BLD}2.${C_RST}"
+  local n3="${C_CYN}${C_BLD}3.${C_RST}" n4="${C_CYN}${C_BLD}4.${C_RST}"
+  local n5="${C_CYN}${C_BLD}5.${C_RST}"
+  section "Next steps (read this!)"
+  printf '  %s Reboot. Limine should be first in boot order; the old Fedora/GRUB entry is kept.\n' "$n1"
+  printf '  %s Test every kernel entry in Limine. Keep GRUB until you are sure.\n' "$n2"
+  printf '  %s Kernel updates happen automatically via the hook:\n     %s\n' "$n3" "$HOOK_FILE"
+  printf '     After editing %s, run:  sudo limine-update\n' "$CONFIG_FILE"
+  printf '  %s Rollback any time: firmware boot menu → pick "Fedora" (GRUB), or:\n     sudo efibootmgr -o <fedora-num>,<limine-num>\n' "$n4"
+  printf '     Full uninstall:  sudo %s --uninstall\n' "$0"
+  printf '  %s Only when Limine is proven: remove GRUB (docs/removing-grub.md).\n     Do NOT remove shim/grub blindly — they are dnf-protected for a reason.\n' "$n5"
   # SB-specific next steps (only when configured).
   if [[ -f "$CONFIG_FILE" ]]; then
     local sbmode
     sbmode="$(grep '^SECURE_BOOT=' "$CONFIG_FILE" 2>/dev/null | cut -d'"' -f2 || true)"
     if [[ -n "${sbmode:-}" && "$sbmode" != "no" ]]; then
       if [[ "$sbmode" == "mok-shim" ]]; then
-        echo
-        echo "Secure Boot (mok-shim): BootOrder puts 'Fedora' (shim) first so the NEXT"
-        echo "  boot reaches MokManager (blue screen) — complete Enroll MOK there,"
-        echo "  then boot via the 'Fedora' (shim) entry. Direct 'Limine' entry works"
-        echo "  only with SB off until the MOK is enrolled. Kernel/conf updates"
-        echo "  re-sign automatically via the hook."
+        section "Secure Boot (mok-shim) — one more boot"
+        bullet "BootOrder puts 'Fedora' (shim) first, so the NEXT boot reaches MokManager."
+        bullet "On the blue screen: Enroll MOK → Continue → Yes, then reboot."
+        bullet "After that, boot via the 'Fedora' (shim) entry."
+        bullet "The direct 'Limine' entry works only with SB off until the MOK is enrolled."
+        bullet "Kernel and config updates re-sign automatically via the hook."
       else
-        echo
-        echo "Secure Boot (custom-db): enroll your key in firmware Setup Mode"
-        echo "  (see README), then: sudo $0 --sb-resign"
+        section "Secure Boot (custom-db) — next step"
+        bullet "Enroll your key in firmware Setup Mode (docs/secure-boot.md), then:"
+        hint "sudo $0 --sb-resign"
       fi
     fi
   fi
-  cat <<EOF2
-
-Log: $LOG_FILE
-Backup: ${BACKUP_DEST:-$BACKUP_ROOT/<timestamp>}
-Docs: README.md (Secure Boot, snapshots, troubleshooting, GRUB removal)
-EOF2
+  section "Info"
+  kv "log" "$LOG_FILE"
+  kv "backup" "${BACKUP_DEST:-$BACKUP_ROOT/<timestamp>}"
+  kv "docs" "README.md and docs/ (secure boot, snapshots, troubleshooting, GRUB removal)"
 }
 
 # ---------------------------------------------------------------- uninstall
 
 do_uninstall() {
   banner
-  echo "Rollback / uninstall mode."
+  printf '  %sMode:%s rollback / uninstall\n' "$C_DIM" "$C_RST"
   need_root
   local esp
   esp="$(detect_esp)" || die "ESP not found."
-  echo "ESP: $esp"
-  efibootmgr -v 2>/dev/null | head -n 30 || true
-  warn "This will:"
-  echo "  - Move the Fedora/GRUB entry back to FIRST in BootOrder (Limine kept, deprioritized),"
-  echo "  - Optionally delete Limine NVRAM entry, ESP files, hook + scripts, $CONFIG_FILE."
+  section "Current boot state"
+  kv "ESP" "$esp"
+  efi_list | head -n 30 | ui_indent || true
+  section "This will"
+  bullet "Move the Fedora/GRUB entry back to FIRST in BootOrder (Limine kept, deprioritized)"
+  bullet "Optionally delete the Limine NVRAM entry, ESP files, hook + scripts, $CONFIG_FILE"
+  bullet "Never touch GRUB/shim packages"
   confirm "Continue with rollback?" || die "Aborted."
   local fedora_num limine_num order rest
   fedora_num="$(efibootmgr 2>/dev/null | grep -i 'fedora' | head -n1 | grep -o '[0-9A-Fa-f]\{4\}' | head -n1 || true)"
@@ -3274,7 +3374,13 @@ main() {
   DO_NVIDIA="skip"
   BACKUP_DEST=""
 
-  preflight  # sets ESP (global)
+  if [[ "$MODE" == "install" || "$MODE" == "check" ]]; then
+    preflight  # sets ESP (global)
+  else
+    banner
+    is_fedora || die "This script is for Fedora only (ID=fedora in /etc/os-release)."
+    detect_sb_state
+  fi
   MACHINE="$(machine_id)"
 
   if [[ "$MODE" == "check" ]]; then
@@ -3315,10 +3421,9 @@ main() {
   # ---- install wizard -------------------------------------------------------
   # Auto-detect: a previous run leaves $STATE_FILE (valid KEY="value" lines).
   if install_state_present; then
-    echo
-    echo "${C_BLD}--- Previous install detected ---${C_RST}"
+    section "Previous install detected"
     install_state_summary
-    echo "Re-running the full wizard will back up + reinstall over it."
+    hint "Re-running the full wizard backs up and reinstalls over it."
     local prev_choice
     prev_choice="$(ask_numbered "How to proceed" \
       "Reinstall (full wizard)" \
@@ -3340,16 +3445,30 @@ main() {
       *) die "Aborted. No changes made." ;;
     esac
   fi
-  echo
-  echo "${C_BLD}Install plan:${C_RST}"
-  echo "  ESP: $ESP   machine-id: $MACHINE"
-  echo "  1) backup  2) deps (+opt CachyOS kernel)  3) download Limine  4) deploy EFI  5) config + hook"
-  echo "  6) theme  7) sync kernels  8) NVRAM (Limine first, GRUB kept)  9) extras  10) verify"
-  echo "  GRUB removal is NEVER automatic."
+  section "Install plan"
+  kv "ESP" "$ESP"
+  kv "machine-id" "$MACHINE"
+  local plan_i=1 plan_step
+  for plan_step in \
+    "Backup" \
+    "Dependencies (+ optional CachyOS kernel)" \
+    "Download Limine" \
+    "Deploy EFI" \
+    "Config + kernel-install hook" \
+    "Boot theme" \
+    "Sync kernels to the ESP" \
+    "NVRAM entry (Limine first, GRUB kept)" \
+    "Optional extras (memtest, shell, snapshots)" \
+    "Verify"; do
+    printf '  %s%2d.%s %s\n' "$C_CYN$C_BLD" "$plan_i" "$C_RST" "$plan_step"
+    plan_i=$((plan_i + 1))
+  done
+  hint "Secure Boot signing runs as an extra step if you enable it below."
+  hint "GRUB is NEVER removed automatically."
   confirm "Start the install?" || die "Aborted. No changes made."
 
   # Basic choices up front (idiot-proof defaults).
-  echo
+  if [[ "$ASSUME_YES" -eq 0 ]]; then section "Install options"; fi
   r="$(ask_yes_no "Install fallback EFI/BOOT/BOOTX64.EFI copy?" "yes")"; [[ "$r" == "yes" ]] && DO_FALLBACK=1 || DO_FALLBACK=0
   r="$(ask_yes_no "Create 'Limine' NVRAM entry + put it first?" "yes")"; [[ "$r" == "yes" ]] && DO_EFIBOOTMGR=1 || DO_EFIBOOTMGR=0
   r="$(ask_yes_no "Auto-add Windows/other EFI entries if found?" "yes")"; [[ "$r" == "yes" ]] && DO_DUALBOOT_SCAN=1 || DO_DUALBOOT_SCAN=0
@@ -3385,10 +3504,13 @@ Options:
 GRUB is untouched and remains bootable. No Limine changes were made."
   fi
 
+  phase 1 10 "Backup"
   do_backup
+  phase 2 10 "Dependencies"
   install_deps
   install_cachyos_kernel  # COPR enable + dnf install (before sync so ESP picks it up)
 
+  phase 3 10 "Download Limine"
   LIMINE_VER="$(limine_version_menu)"
   if [[ "$LIMINE_VER" == "latest" ]]; then
     LIMINE_VER="$(latest_limine_version)"
@@ -3399,6 +3521,7 @@ GRUB is untouched and remains bootable. No Limine changes were made."
   trap "rm -rf '$WORKDIR'" EXIT
   fetch_limine "$LIMINE_VER" "$WORKDIR"
 
+  phase 4 10 "Deploy EFI"
   # Persist the `limine` host tool (needed for bios-install + enroll-config).
   if [[ -x "$LIMINE_SRC/limine" ]]; then
     log "Installing limine host tool -> $LIMINE_TOOL ..."
@@ -3415,20 +3538,26 @@ GRUB is untouched and remains bootable. No Limine changes were made."
   deploy_uefi "$ESP" "$LIMINE_SRC"
   if [[ "$DO_BIOS" -eq 1 ]]; then deploy_bios "$LIMINE_SRC"; fi
 
+  phase 5 10 "Config + kernel-install hook"
   write_default_config
   install_hook_and_sync_script
   # Theme before the kernel sync so the generated limine.conf carries it.
   # A failed theme download never aborts the install (falls back to none).
+  phase 6 10 "Boot theme"
   fetch_theme "$DO_THEME_ID" "$ESP" || {
     warn "Continuing without theme visuals."
     config_set_key "$CONFIG_FILE" "THEME_NAME" "none" || true
   }
+  phase 7 10 "Sync kernels to the ESP"
   sync_all_kernels
+  phase 8 10 "NVRAM entry (Limine first, GRUB kept)"
   register_efibootmgr "$ESP"
+  phase 9 10 "Optional extras"
   # extras need 0/1 ints; DO_SNAPSHOTS currently "auto"/"no" -> map back for installer.
   if [[ "$DO_SNAPSHOTS" == "auto" ]]; then DO_SNAPSHOTS=1; else DO_SNAPSHOTS=0; fi
   install_extras "$ESP"
   if [[ "$DO_SECUREBOOT" != "no" ]]; then
+    phase "-" 10 "Secure Boot setup"
     # Re-read key dir (existing config may define a custom one we kept).
     SB_KEYS="$(grep '^SB_KEY_DIR=' "$CONFIG_FILE" 2>/dev/null | cut -d'"' -f2 || true)"
     [[ -z "${SB_KEYS:-}" ]] && SB_KEYS="$SB_KEY_DIR"
@@ -3437,6 +3566,7 @@ GRUB is untouched and remains bootable. No Limine changes were made."
       custom-db) sb_setup_db "$ESP" ;;
     esac
   fi
+  phase 10 10 "Verify"
   verify_install "$ESP"
   write_install_state "$LIMINE_VER"
   print_next_steps
