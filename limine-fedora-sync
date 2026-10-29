@@ -1,0 +1,339 @@
+#!/usr/bin/env bash
+# limine-fedora-sync — copy Fedora kernels to the FAT ESP + regenerate limine.conf
+# Called by /etc/kernel/install.d/95-limine.install on every kernel add/remove,
+# and manually by `limine-update`. CachyOS equivalent: limine-mkinitcpio / limine-dracut
+# + limine-entry-tool --add-kernel.
+# Secure Boot: when ENABLE_VERIFICATION=yes (forced when SECURE_BOOT != no),
+# linux paths get #<b2sum> suffixes; when ENABLE_ENROLL_CONFIG=yes the conf
+# hash is re-enrolled into managed EFIs and they are re-signed (sb_post_process).
+#
+# Layout (CachyOS-style): $ESP/<machine-id>/<version>/{vmlinuz-*,initramfs-*.img}
+# Config search path covered: $ESP/limine.conf + $ESP/EFI/limine/limine.conf + $ESP/EFI/BOOT/limine.conf
+set -euo pipefail
+CONFIG="/etc/default/limine"
+# Defaults if config missing:
+ESP_PATH="${ESP_PATH:-/boot/efi}"
+MACHINE_ID="$(cat /etc/machine-id 2>/dev/null | tr -d ' \n')"
+TIMEOUT="5"; DEFAULT_ENTRY="1"; REMEMBER_LAST="yes"
+TERM_PALETTE="1e1e2e;f38ba8;a6e3a1;f9e2af;89b4fa;f5c2e7;94e2d5;cdd6f4"
+TERM_PALETTE_BRIGHT="585b70;f38ba8;a6e3a1;f9e2af;89b4fa;f5c2e7;94e2d5;cdd6f4"
+TERM_BACKGROUND="ffffffff"; TERM_FOREGROUND="cdd6f4"; WALLPAPER=""
+TARGET_OS_NAME="Fedora Linux"; KERNEL_CMDLINE=""; BOOT_ORDER="*, *fallback, *rescue, Snapshots"
+FIND_BOOTLOADERS="yes"; ENABLE_SNAPSHOTS="auto"; MAX_SNAPSHOT_ENTRIES="10"
+SECURE_BOOT="no"; SB_KEY_DIR="/etc/limine/keys"
+ENABLE_VERIFICATION="no"; ENABLE_ENROLL_CONFIG="no"; ENABLE_FALLBACK="yes"
+LIMINE_TOOL="/usr/local/bin/limine"
+# shellcheck disable=SC1090
+[[ -f "$CONFIG" ]] && . "$CONFIG"
+[[ -n "${MACHINE_ID_OVERRIDE:-}" ]] && MACHINE_ID="$MACHINE_ID_OVERRIDE"
+[[ -n "${MACHINE_ID:-}" ]] || MACHINE_ID="$(cat /etc/machine-id | tr -d ' \n')"
+ESP="${ESP_PATH}"
+[[ -d "$ESP" ]] || { echo "limine-fedora-sync: ESP not found: $ESP" >&2; exit 1; }
+
+KERNEL_DIR_BASE="$ESP/$MACHINE_ID"
+mkdir -p "$KERNEL_DIR_BASE"
+
+list_fedora_kernels() {
+  # Canonical list: /boot/vmlinuz-<ver> or /usr/lib/modules/*/vmlinuz or /lib/modules/*/vmlinuz, newest first by version sort.
+  local versions=()
+  # Check /boot first (traditional layout)
+  if ls /boot/vmlinuz-* >/dev/null 2>&1; then
+    mapfile -t versions < <(ls -1 /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||' | grep -v '^0-rescue' | sort -Vr)
+  fi
+  # Check /usr/lib/modules for newer Fedora layouts
+  if [ ${#versions[@]} -eq 0 ] && ls /usr/lib/modules/*/vmlinuz >/dev/null 2>&1; then
+    mapfile -t versions < <(ls -1d /usr/lib/modules/*/vmlinuz 2>/dev/null | xargs -n1 dirname | xargs -n1 basename | grep -v '^0-rescue' | sort -Vr)
+  fi
+  # Also check /lib/modules
+  if [ ${#versions[@]} -eq 0 ] && ls /lib/modules/*/vmlinuz >/dev/null 2>&1; then
+    mapfile -t versions < <(ls -1d /lib/modules/*/vmlinuz 2>/dev/null | xargs -n1 dirname | xargs -n1 basename | grep -v '^0-rescue' | sort -Vr)
+  fi
+  # Combine all sources
+  {
+    ls -1 /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||' | grep -v '^0-rescue'
+    ls -1d /usr/lib/modules/*/vmlinuz 2>/dev/null | xargs -n1 dirname | xargs -n1 basename | grep -v '^0-rescue'
+    ls -1d /lib/modules/*/vmlinuz 2>/dev/null | xargs -n1 dirname | xargs -n1 basename | grep -v '^0-rescue'
+  } | sort -uVr | grep -v '^$' || printf '%s\n' "${versions[@]}" | grep -v '^$'
+}
+
+
+
+rescue_kernel() {
+  local rk
+  rk="$(ls -1 /boot/vmlinuz-0-rescue* 2>/dev/null | head -n1 || true)"
+  if [ -n "$rk" ]; then
+    echo "$rk"
+    return
+  fi
+  # Check /usr/lib/modules for rescue
+  for d in /usr/lib/modules/*rescue* /lib/modules/*rescue*; do
+    [ -d "$d" ] && [ -f "$d/vmlinuz" ] && echo "$d/vmlinuz" && return
+  done
+  rk="$(find /boot/efi -name 'vmlinuz-0-rescue*' 2>/dev/null | head -n1 || true)"
+  [ -n "$rk" ] && echo "$rk"
+}
+
+rescue_initramfs() {
+  local ri
+  ri="$(ls -1 /boot/initramfs-0-rescue*.img 2>/dev/null | head -n1 || true)"
+  [ -n "$ri" ] && echo "$ri" && return
+  for d in /usr/lib/modules/*rescue* /lib/modules/*rescue*; do
+    [ -d "$d" ] && [ -f "$d/initramfs*.img" ] && find "$d" -name 'initramfs*.img' | head -n1 && return
+  done
+  ri="$(find /boot/efi -name 'initramfs-0-rescue*.img' 2>/dev/null | head -n1 || true)"
+  [ -n "$ri" ] && echo "$ri"
+}
+
+
+sync_one() {
+  local ver="$1"
+  local src_vmlinuz="" src_initrd=""
+  # Try different locations
+  if [[ -f "/boot/vmlinuz-$ver" ]]; then
+    src_vmlinuz="/boot/vmlinuz-$ver"
+  elif [[ -f "/usr/lib/modules/$ver/vmlinuz" ]]; then
+    src_vmlinuz="/usr/lib/modules/$ver/vmlinuz"
+  elif [[ -f "/lib/modules/$ver/vmlinuz" ]]; then
+    src_vmlinuz="/lib/modules/$ver/vmlinuz"
+  elif [[ -f "/boot/efi/ffae1882fc554a06b33602553e3d303f/$ver/vmlinuz-$ver" ]]; then
+    src_vmlinuz="/boot/efi/ffae1882fc554a06b33602553e3d303f/$ver/vmlinuz-$ver"
+  fi
+  if [[ -f "/boot/initramfs-$ver.img" ]]; then
+    src_initrd="/boot/initramfs-$ver.img"
+  elif [[ -f "/usr/lib/modules/$ver/initramfs*.img" ]]; then
+    src_initrd="$(find /usr/lib/modules/$ver -name 'initramfs*.img' 2>/dev/null | head -n1)"
+  elif [[ -f "/lib/modules/$ver/initramfs*.img" ]]; then
+    src_initrd="$(find /lib/modules/$ver -name 'initramfs*.img' 2>/dev/null | head -n1)"
+  elif [[ -f "/boot/initramfs-$ver*.img" ]]; then
+    src_initrd="$(ls -1 /boot/initramfs-$ver*.img 2>/dev/null | head -n1)"
+  elif [[ -f "/boot/efi/ffae1882fc554a06b33602553e3d303f/$ver/initramfs-$ver.img" ]]; then
+    src_initrd="/boot/efi/ffae1882fc554a06b33602553e3d303f/$ver/initramfs-$ver.img"
+  fi
+  [[ -f "$src_vmlinuz" ]] || { echo "  skip $ver (no kernel image found)"; return 0; }
+  local dest="$KERNEL_DIR_BASE/$ver"
+  mkdir -p "$dest"
+  echo "  sync $ver -> $dest"
+  cp -v --preserve=timestamps "$src_vmlinuz" "$dest/vmlinuz-$ver"
+  if [[ -n "$src_initrd" ]] && [[ -f "$src_initrd" ]]; then
+    cp -v --preserve=timestamps "$src_initrd" "$dest/initramfs-$ver.img"
+  else
+    echo "  WARN: no initramfs for $ver (may be in UKI format or missing)" >&2
+  fi
+  command -v restorecon >/dev/null 2>&1 && restorecon -R "$dest" 2>/dev/null || true
+}
+
+prune_stale() {
+  # Remove ESP dirs for kernels no longer in /boot or /usr/lib/modules.
+  local d ver
+  for d in "$KERNEL_DIR_BASE"/*/; do
+    [[ -d "$d" ]] || continue
+    ver="$(basename "$d")"
+    if [[ "$ver" == "rescue" ]]; then
+      continue
+    fi
+    if [[ ! -f "/boot/vmlinuz-$ver" && ! -f "/usr/lib/modules/$ver/vmlinuz" && ! -f "/lib/modules/$ver/vmlinuz" && ! -f "/boot/efi/$MACHINE_ID/$ver/vmlinuz-$ver" ]]; then
+      echo "  prune stale ESP entry: $ver"
+      rm -rf "$d"
+    fi
+  done
+}
+
+sb_post_process() {
+  # Secure Boot: re-enroll conf hash + re-sign managed EFIs after every regen.
+  # Never fails the caller (kernel-install hook must not break): warn + continue.
+  [[ "${ENABLE_ENROLL_CONFIG:-no}" == "yes" ]] || return 0
+  local tool="${LIMINE_TOOL:-/usr/local/bin/limine}"
+  command -v "$tool" >/dev/null 2>&1 || tool="$(command -v limine 2>/dev/null || true)"
+  [[ -n "${tool:-}" ]] || { echo "  SB: limine tool missing, skipping enroll/sign" >&2; return 0; }
+  local keydir="${SB_KEY_DIR:-/etc/limine/keys}"
+  if [[ ! -f "$keydir/MOK.priv" || ! -f "$keydir/MOK.pem" ]]; then
+    echo "  SB: keys missing in $keydir, skipping enroll/sign (run limine --sb-setup)" >&2
+    return 0
+  fi
+  command -v sbsign >/dev/null 2>&1 || { echo "  SB: sbsign missing, skipping sign" >&2; return 0; }
+  local hash e tmp
+  hash="$(b2sum "$ESP/limine.conf" | cut -d' ' -f1)"
+  local efis=()
+  efis+=("$ESP/EFI/limine/limine_x64.efi")
+  [[ "${ENABLE_FALLBACK:-yes}" == "yes" ]] && efis+=("$ESP/EFI/BOOT/BOOTX64.EFI")
+  if [[ "${SECURE_BOOT:-no}" == "mok-shim" && -f "$ESP/EFI/fedora/grubx64.efi.grub-bak" && -f "$ESP/EFI/fedora/grubx64.efi" ]]; then
+    efis+=("$ESP/EFI/fedora/grubx64.efi")
+  fi
+  for e in "${efis[@]}"; do
+    [[ -f "$e" ]] || continue
+    "$tool" enroll-config "$e" "$hash" >/dev/null 2>&1 || { echo "  SB: enroll failed for $e" >&2; continue; }
+    tmp="$(mktemp /tmp/limine-sign-XXXXXX.efi)"
+    if sbsign --key "$keydir/MOK.priv" --cert "$keydir/MOK.pem" --output "$tmp" "$e" >/dev/null 2>&1; then
+      mv "$tmp" "$e"
+    else
+      rm -f "$tmp"; echo "  SB: sbsign failed for $e" >&2
+    fi
+  done
+  command -v restorecon >/dev/null 2>&1 && restorecon -R "$ESP/EFI" 2>/dev/null || true
+}
+
+gen_conf() {
+  local tmp="$ESP/limine.conf.tmp"
+  local wallpaper_line=""
+  local VERIFY_ON="no"
+  [[ "${ENABLE_VERIFICATION:-no}" == "yes" || "${SECURE_BOOT:-no}" != "no" ]] && VERIFY_ON="yes"
+  if [[ -n "${WALLPAPER:-}" && -f "${WALLPAPER:-}" ]]; then
+    cp -v "$WALLPAPER" "$ESP/limine-splash.png" 2>/dev/null || true
+    if [[ "$VERIFY_ON" == "yes" && -f "$ESP/limine-splash.png" ]]; then
+      wallpaper_line="wallpaper: boot():/limine-splash.png#$(b2sum "$ESP/limine-splash.png" | cut -d' ' -f1)"
+    else
+      wallpaper_line="wallpaper: boot():/limine-splash.png"
+    fi
+  fi
+  {
+    echo "# Generated by limine-fedora-sync on $(date -u +%FT%TZ). DO NOT EDIT — edit $CONFIG then run limine-update."
+    echo "timeout: ${TIMEOUT}"
+    echo "default_entry: ${DEFAULT_ENTRY}"
+    echo "remember_last_entry: ${REMEMBER_LAST}"
+    echo "term_palette: ${TERM_PALETTE}"
+    echo "term_palette_bright: ${TERM_PALETTE_BRIGHT}"
+    echo "term_background: ${TERM_BACKGROUND}"
+    echo "term_foreground: ${TERM_FOREGROUND}"
+    [[ -n "$wallpaper_line" ]] && echo "$wallpaper_line"
+    echo ""
+    echo "/${TARGET_OS_NAME}"
+    # Normal kernels, newest first.
+    local vers v printed=0
+  vers="$(list_fedora_kernels)"
+    for v in $vers; do
+      [[ -f "$KERNEL_DIR_BASE/$v/vmlinuz-$v" ]] || continue
+      printed=$((printed+1))
+      # BLAKE2b suffixes when verification is on (mandatory under SB+enroll).
+      local kfile="$KERNEL_DIR_BASE/$v/vmlinuz-$v" ifile="$KERNEL_DIR_BASE/$v/initramfs-$v.img"
+      local ksuffix="" isuffix=""
+      if [[ "$VERIFY_ON" == "yes" ]]; then
+        ksuffix="#$(b2sum "$kfile" | cut -d' ' -f1)"
+        [[ -f "$ifile" ]] && isuffix="#$(b2sum "$ifile" | cut -d' ' -f1)"
+      fi
+      echo "    //${v}"
+      echo "    comment: Fedora kernel $v (auto-generated)"
+      echo "    protocol: linux"
+      echo "    path: boot():/${MACHINE_ID}/${v}/vmlinuz-${v}${ksuffix}"
+      # KERNEL_CMDLINE already contains root=... ; fall back to /proc/cmdline if empty.
+      local cmd="$KERNEL_CMDLINE"
+      [[ -z "$cmd" ]] && cmd="$(tr ' ' '\n' < /proc/cmdline | grep -v '^BOOT_IMAGE=' | tr '\n' ' ')"
+      echo "    cmdline: ${cmd}"
+      if [[ -f "$KERNEL_DIR_BASE/$v/initramfs-$v.img" ]]; then
+        echo "    module_path: boot():/${MACHINE_ID}/${v}/initramfs-${v}.img${isuffix}"
+      fi
+      echo ""
+    done
+    [[ "$printed" -gt 0 ]] || echo "    //no-kernels-found (run: kernel-install add-all)"
+    # Rescue entry (Fedora dracut rescue image).
+    local rvmlinuz rinitrd
+    rvmlinuz="$(rescue_kernel)"
+    rinitrd="$(rescue_initramfs)"
+    if [[ -n "$rvmlinuz" && -f "$rvmlinuz" ]]; then
+      mkdir -p "$KERNEL_DIR_BASE/rescue"
+      cp -n --preserve=timestamps "$rvmlinuz" "$KERNEL_DIR_BASE/rescue/$(basename "$rvmlinuz")" 2>/dev/null || true
+      [[ -n "$rinitrd" && -f "$rinitrd" ]] && cp -n --preserve=timestamps "$rinitrd" "$KERNEL_DIR_BASE/rescue/$(basename "$rinitrd")" 2>/dev/null || true
+      local rb vb
+      rb="$(basename "$rvmlinuz")"; vb="$rb"
+      local rksuffix="" risuffix=""
+      if [[ "$VERIFY_ON" == "yes" ]]; then
+        [[ -f "$KERNEL_DIR_BASE/rescue/$rb" ]] && rksuffix="#$(b2sum "$KERNEL_DIR_BASE/rescue/$rb" | cut -d' ' -f1)"
+        if [[ -n "$rinitrd" && -f "$KERNEL_DIR_BASE/rescue/$(basename "$rinitrd")" ]]; then
+          risuffix="#$(b2sum "$KERNEL_DIR_BASE/rescue/$(basename "$rinitrd")" | cut -d' ' -f1)"
+        fi
+      fi
+      echo "    //rescue"
+      echo "    comment: Fedora rescue (auto-generated)"
+      echo "    protocol: linux"
+      echo "    path: boot():/${MACHINE_ID}/rescue/${rb}${rksuffix}"
+      local cmd="$KERNEL_CMDLINE"
+      [[ -z "$cmd" ]] && cmd="$(tr ' ' '\n' < /proc/cmdline | grep -v '^BOOT_IMAGE=' | tr '\n' ' ')"
+      echo "    cmdline: ${cmd} single nomodeset"
+      if [[ -n "$rinitrd" && -f "$KERNEL_DIR_BASE/rescue/$(basename "$rinitrd")" ]]; then
+        echo "    module_path: boot():/${MACHINE_ID}/rescue/$(basename "$rinitrd")${risuffix}"
+      fi
+      echo ""
+    fi
+    # Snapshot placeholder (filled by snapper helper if enabled; harmless if empty).
+    if [[ "$ENABLE_SNAPSHOTS" == "yes" || "$ENABLE_SNAPSHOTS" == "auto" ]]; then
+      if [[ -f "$ESP/limine-snapshots.conf" ]]; then
+        echo "    //Snapshots"
+        cat "$ESP/limine-snapshots.conf"
+        echo ""
+      fi
+    fi
+    # Dual-boot scan: Windows + other EFI loaders on the ESP.
+    if [[ "$FIND_BOOTLOADERS" == "yes" ]]; then
+      if [[ -f "$ESP/EFI/Microsoft/Boot/bootmgfw.efi" ]]; then
+        echo "/Windows Boot Manager"
+        echo "    protocol: efi"
+        echo "    path: boot():/EFI/Microsoft/Boot/bootmgfw.efi"
+        echo ""
+      fi
+      # memtest86+ (Fedora package drops it at /boot/efi/EFI/memtest86+/... or /boot/memtest*)
+      local mem=""
+      for mem in "$ESP/EFI/memtest86+/memtest86x64.efi" "$ESP/memtest86+/memtest86x64.efi"; do
+        if [[ -f "$mem" ]]; then
+          local rel="${mem#$ESP/}"
+          echo "/Memtest86+"
+          echo "    protocol: efi"
+          echo "    path: boot():/${rel}"
+          echo ""
+          break
+        fi
+      done
+      # EDK2 shell if present.
+      if [[ -f "$ESP/EFI/tools/Shell.efi" || -f "$ESP/shellx64.efi" ]]; then
+        local sh="EFI/tools/Shell.efi"
+        [[ -f "$ESP/shellx64.efi" ]] && sh="shellx64.efi"
+        echo "/EDK2 Shell"
+        echo "    protocol: efi"
+        echo "    path: boot():/${sh}"
+        echo ""
+      fi
+    fi
+  } > "$tmp"
+  # Atomic publish to all locations Limine searches (vfat has no symlinks -> copy).
+  cp -v "$tmp" "$ESP/limine.conf"
+  mkdir -p "$ESP/EFI/limine" "$ESP/EFI/BOOT" "$ESP/boot/limine" 2>/dev/null || true
+  cp -v "$tmp" "$ESP/EFI/limine/limine.conf"
+  cp -v "$tmp" "$ESP/EFI/BOOT/limine.conf"
+  rm -f "$tmp"
+  sb_post_process
+  echo "limine.conf regenerated ($(grep -c '^    //\|^/' "$ESP/limine.conf") entries)."
+}
+
+case "${1:-sync}" in
+  sync|add|resync|regenerate)
+    if [[ "${2:-}" != "" && "${2:-}" != "all" ]]; then
+      sync_one "$2"   # single-version fast path from kernel-install hook
+    else
+      for v in $(list_fedora_kernels); do
+        [[ -n "$v" ]] || continue
+        sync_one "$v"
+      done
+      prune_stale
+    fi
+    gen_conf
+    ;;
+  remove)
+    ver="${2:-}"; [[ -n "$ver" ]] && rm -rf "$KERNEL_DIR_BASE/$ver"
+    gen_conf
+    ;;
+  conf-only|config)
+    gen_conf
+    ;;
+  *)
+    echo "Usage: $0 [sync [VERSION|all]|remove VERSION|conf-only]"; exit 2 ;;
+esac
+
+kernel_cmdline() {
+  # Precedence (matches kernel-install): /etc/kernel/cmdline > /usr/lib/kernel/cmdline > /proc/cmdline minus BOOT_IMAGE
+  if [[ -f /etc/kernel/cmdline ]]; then
+    cat /etc/kernel/cmdline
+  elif [[ -f /usr/lib/kernel/cmdline ]]; then
+    cat /usr/lib/kernel/cmdline
+  else
+    tr ' ' '\n' < /proc/cmdline | grep -v '^BOOT_IMAGE=' | tr '\n' ' ' | sed 's/ *$//'
+  fi
+}
+

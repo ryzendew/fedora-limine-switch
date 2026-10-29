@@ -1,0 +1,19 @@
+#!/usr/bin/bash
+# 95-limine.install — Fedora kernel-install plugin for Limine.
+# Runs after 50-dracut (so initramfs exists) on every kernel add/remove.
+# Mirrors CachyOS 90-mkinitcpio-install.hook / 90-limine-dracut-install.hook.
+COMMAND="${1:?}"
+KERNEL_VERSION="${2:?}"
+# BOOT_DIR_ABS / KERNEL_IMAGE may be present but we sync from /boot directly.
+if ! [[ ${KERNEL_INSTALL_MACHINE_ID-x} ]]; then exit 0; fi
+case "$COMMAND" in
+  add)
+    # dracut (50-dracut.install) runs first (lexicographic 50 < 95), so
+    # /boot/initramfs-<ver>.img already exists here on a normal install.
+    /usr/local/sbin/limine-fedora-sync sync "$KERNEL_VERSION" || exit 0
+    ;;
+  remove)
+    /usr/local/sbin/limine-fedora-sync remove "$KERNEL_VERSION" || exit 0
+    ;;
+  *) exit 0 ;;
+esac
