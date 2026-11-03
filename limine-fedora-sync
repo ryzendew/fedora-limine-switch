@@ -34,29 +34,11 @@ KERNEL_DIR_BASE="$ESP/$MACHINE_ID"
 mkdir -p "$KERNEL_DIR_BASE"
 
 list_fedora_kernels() {
-  # Canonical list: /boot/vmlinuz-<ver> or /usr/lib/modules/*/vmlinuz or /lib/modules/*/vmlinuz, newest first by version sort.
-  local versions=()
-  # Check /boot first (traditional layout)
-  if ls /boot/vmlinuz-* >/dev/null 2>&1; then
-    mapfile -t versions < <(ls -1 /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||' | grep -v '^0-rescue' | sort -Vr)
-  fi
-  # Check /usr/lib/modules for newer Fedora layouts
-  if [ ${#versions[@]} -eq 0 ] && ls /usr/lib/modules/*/vmlinuz >/dev/null 2>&1; then
-    mapfile -t versions < <(ls -1d /usr/lib/modules/*/vmlinuz 2>/dev/null | xargs -n1 dirname | xargs -n1 basename | grep -v '^0-rescue' | sort -Vr)
-  fi
-  # Also check /lib/modules
-  if [ ${#versions[@]} -eq 0 ] && ls /lib/modules/*/vmlinuz >/dev/null 2>&1; then
-    mapfile -t versions < <(ls -1d /lib/modules/*/vmlinuz 2>/dev/null | xargs -n1 dirname | xargs -n1 basename | grep -v '^0-rescue' | sort -Vr)
-  fi
-  # Combine all sources
   {
-    ls -1 /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||' | grep -v '^0-rescue'
-    ls -1d /usr/lib/modules/*/vmlinuz 2>/dev/null | xargs -n1 dirname | xargs -n1 basename | grep -v '^0-rescue'
-    ls -1d /lib/modules/*/vmlinuz 2>/dev/null | xargs -n1 dirname | xargs -n1 basename | grep -v '^0-rescue'
-  } | sort -uVr | grep -v '^$' || printf '%s\n' "${versions[@]}" | grep -v '^$'
+    ls -1 /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||'
+    ls -1d /usr/lib/modules/*/vmlinuz 2>/dev/null | xargs -r -n1 dirname | xargs -r -n1 basename
+  } | grep -v '^0-rescue' | grep -v '^$' | sort -uVr || true
 }
-
-
 
 rescue_kernel() {
   local rk
@@ -78,7 +60,7 @@ rescue_initramfs() {
   ri="$(ls -1 /boot/initramfs-0-rescue*.img 2>/dev/null | head -n1 || true)"
   [ -n "$ri" ] && echo "$ri" && return
   for d in /usr/lib/modules/*rescue* /lib/modules/*rescue*; do
-    [ -d "$d" ] && [ -f "$d/initramfs*.img" ] && find "$d" -name 'initramfs*.img' | head -n1 && return
+    [ -d "$d" ] && compgen -G "$d/initramfs*.img" | head -n1 | grep . && return
   done
   ri="$(find /boot/efi -name 'initramfs-0-rescue*.img' 2>/dev/null | head -n1 || true)"
   [ -n "$ri" ] && echo "$ri"
@@ -86,39 +68,24 @@ rescue_initramfs() {
 
 
 sync_one() {
-  local ver="$1"
-  local src_vmlinuz="" src_initrd=""
-  # Try different locations
-  if [[ -f "/boot/vmlinuz-$ver" ]]; then
-    src_vmlinuz="/boot/vmlinuz-$ver"
-  elif [[ -f "/usr/lib/modules/$ver/vmlinuz" ]]; then
-    src_vmlinuz="/usr/lib/modules/$ver/vmlinuz"
-  elif [[ -f "/lib/modules/$ver/vmlinuz" ]]; then
-    src_vmlinuz="/lib/modules/$ver/vmlinuz"
-  elif [[ -f "/boot/efi/ffae1882fc554a06b33602553e3d303f/$ver/vmlinuz-$ver" ]]; then
-    src_vmlinuz="/boot/efi/ffae1882fc554a06b33602553e3d303f/$ver/vmlinuz-$ver"
+  local ver="$1" src_vmlinuz="" src_initrd=""
+  if [[ -f "/boot/vmlinuz-$ver" ]]; then src_vmlinuz="/boot/vmlinuz-$ver"
+  elif [[ -f "/usr/lib/modules/$ver/vmlinuz" ]]; then src_vmlinuz="/usr/lib/modules/$ver/vmlinuz"
   fi
-  if [[ -f "/boot/initramfs-$ver.img" ]]; then
-    src_initrd="/boot/initramfs-$ver.img"
-  elif [[ -f "/usr/lib/modules/$ver/initramfs*.img" ]]; then
-    src_initrd="$(find /usr/lib/modules/$ver -name 'initramfs*.img' 2>/dev/null | head -n1)"
-  elif [[ -f "/lib/modules/$ver/initramfs*.img" ]]; then
-    src_initrd="$(find /lib/modules/$ver -name 'initramfs*.img' 2>/dev/null | head -n1)"
-  elif [[ -f "/boot/initramfs-$ver*.img" ]]; then
-    src_initrd="$(ls -1 /boot/initramfs-$ver*.img 2>/dev/null | head -n1)"
-  elif [[ -f "/boot/efi/ffae1882fc554a06b33602553e3d303f/$ver/initramfs-$ver.img" ]]; then
-    src_initrd="/boot/efi/ffae1882fc554a06b33602553e3d303f/$ver/initramfs-$ver.img"
-  fi
-  [[ -f "$src_vmlinuz" ]] || { echo "  skip $ver (no kernel image found)"; return 0; }
+  [[ -n "$src_vmlinuz" ]] || { echo "  skip $ver (no kernel image)"; return 0; }
+  src_initrd="$(compgen -G "/boot/initramfs-$ver.img" | head -n1 || true)"
+  [[ -z "$src_initrd" ]] && src_initrd="$(compgen -G "/boot/initramfs-$ver*.img" | head -n1 || true)"
+  [[ -z "$src_initrd" ]] && src_initrd="$(compgen -G "/usr/lib/modules/$ver/initramfs*.img" | head -n1 || true)"
   local dest="$KERNEL_DIR_BASE/$ver"
+  if [[ -z "$src_initrd" ]]; then
+    echo "  ERROR: no initramfs for $ver (fix: dracut --force --kver $ver /boot/initramfs-$ver.img). Skipping, removing ESP copy." >&2
+    rm -rf "$dest"
+    return 0
+  fi
   mkdir -p "$dest"
   echo "  sync $ver -> $dest"
   cp -v --preserve=timestamps "$src_vmlinuz" "$dest/vmlinuz-$ver"
-  if [[ -n "$src_initrd" ]] && [[ -f "$src_initrd" ]]; then
-    cp -v --preserve=timestamps "$src_initrd" "$dest/initramfs-$ver.img"
-  else
-    echo "  WARN: no initramfs for $ver (may be in UKI format or missing)" >&2
-  fi
+  cp -v --preserve=timestamps "$src_initrd" "$dest/initramfs-$ver.img"
   command -v restorecon >/dev/null 2>&1 && restorecon -R "$dest" 2>/dev/null || true
 }
 
@@ -190,18 +157,22 @@ gen_conf() {
     echo "timeout: ${TIMEOUT}"
     echo "default_entry: ${DEFAULT_ENTRY}"
     echo "remember_last_entry: ${REMEMBER_LAST}"
-    echo "term_palette: ${TERM_PALETTE}"
-    echo "term_palette_bright: ${TERM_PALETTE_BRIGHT}"
-    echo "term_background: ${TERM_BACKGROUND}"
-    echo "term_foreground: ${TERM_FOREGROUND}"
+    if [[ -s "${THEME_SNIPPET:-/etc/limine/theme.conf}" ]]; then
+      cat "${THEME_SNIPPET:-/etc/limine/theme.conf}"
+    else
+      echo "term_palette: ${TERM_PALETTE}"
+      echo "term_palette_bright: ${TERM_PALETTE_BRIGHT}"
+      echo "term_background: ${TERM_BACKGROUND}"
+      echo "term_foreground: ${TERM_FOREGROUND}"
+    fi
     [[ -n "$wallpaper_line" ]] && echo "$wallpaper_line"
     echo ""
     echo "/${TARGET_OS_NAME}"
     # Normal kernels, newest first.
     local vers v printed=0
-  vers="$(list_fedora_kernels)"
+    vers="$(list_fedora_kernels)"
     for v in $vers; do
-      [[ -f "$KERNEL_DIR_BASE/$v/vmlinuz-$v" ]] || continue
+      [[ -f "$KERNEL_DIR_BASE/$v/vmlinuz-$v" && -f "$KERNEL_DIR_BASE/$v/initramfs-$v.img" ]] || continue
       printed=$((printed+1))
       # BLAKE2b suffixes when verification is on (mandatory under SB+enroll).
       local kfile="$KERNEL_DIR_BASE/$v/vmlinuz-$v" ifile="$KERNEL_DIR_BASE/$v/initramfs-$v.img"
@@ -325,15 +296,3 @@ case "${1:-sync}" in
   *)
     echo "Usage: $0 [sync [VERSION|all]|remove VERSION|conf-only]"; exit 2 ;;
 esac
-
-kernel_cmdline() {
-  # Precedence (matches kernel-install): /etc/kernel/cmdline > /usr/lib/kernel/cmdline > /proc/cmdline minus BOOT_IMAGE
-  if [[ -f /etc/kernel/cmdline ]]; then
-    cat /etc/kernel/cmdline
-  elif [[ -f /usr/lib/kernel/cmdline ]]; then
-    cat /usr/lib/kernel/cmdline
-  else
-    tr ' ' '\n' < /proc/cmdline | grep -v '^BOOT_IMAGE=' | tr '\n' ' ' | sed 's/ *$//'
-  fi
-}
-
