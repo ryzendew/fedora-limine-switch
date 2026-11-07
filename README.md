@@ -3,6 +3,12 @@
 One interactive script to replace GRUB with **Limine** on Fedora — idiot-proof,
 undoable, and keeping GRUB as a fallback until you're sure.
 
+
+| PayPal | Ko-fi |
+|:---:|:---:|
+|[<img src="https://github.com/vinceliuice/WhiteSur-gtk-theme/blob/pictures/pictures/paypal.png?raw=true" width="32" height="32" alt="paypal" />](https://paypal.me/gamedev1909)|[<img src="https://github.com/user-attachments/assets/06c1704b-ead5-4b4a-a865-9b85aa9f5015" width="32" height="32" alt="ko-fi" />](https://ko-fi.com/tlv)|
+
+
 Tested on: Fedora 41/42/43/45, x86_64, UEFI. Your machine (Fedora 45 prerelease,
 4 GB ESP at `/boot/efi`, Secure Boot disabled, XFS root) is the ideal case.
 
